@@ -45,10 +45,10 @@ snowluma_adapter/
 | `plugin.enabled` | `true` | 插件开关 |
 | `bot.qq_id` | - | Bot 的 QQ 号 |
 | `bot.qq_nickname` | - | Bot 昵称 |
-| `snowluma_server.mode` | `"ws"` | 连接模式 |
-| `snowluma_server.host` | `"127.0.0.1"` | SnowLuma 服务地址 |
-| `snowluma_server.port` | `3001` | SnowLuma 服务端口 |
-| `snowluma_server.access_token` | `""` | 访问令牌 |
+| `snowluma_server.mode` | `"reverse"` | 连接模式（reverse/direct） |
+| `snowluma_server.host` | `"localhost"` | SnowLuma 服务地址 |
+| `snowluma_server.port` | `8095` | SnowLuma 服务端口 |
+| `snowluma_server.access_token` | `""` | 访问令牌（可选） |
 
 ### 功能配置
 
