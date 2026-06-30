@@ -389,13 +389,21 @@ async def get_record_detail(
     file: str,
     file_id: str | None = None,
     *,
+    out_format: str = "wav",
     adapter: "SnowLumaAdapter | None" = None,
 ) -> dict | None:
-    """获取语音信息详情（返回下载 URL 或 base64 数据）。"""
-    logger.debug(f"获取语音信息详情中: file={file}")
+    """获取语音信息详情（返回下载 URL 或 base64 数据）。
+
+    Args:
+        file: 语音文件标识
+        file_id: 语音文件 ID
+        out_format: 输出音频格式（mp3/amr/wma/m4a/spx/ogg/wav/flac），默认 wav
+        adapter: 适配器实例
+    """
+    logger.debug(f"获取语音信息详情中: file={file}, out_format={out_format}")
     response = await _call_adapter_api(
         "get_record",
-        {"file": file, "file_id": file_id or ""},
+        {"file": file, "file_id": file_id or "", "out_format": out_format},
         adapter=adapter,
         timeout=30,
     )

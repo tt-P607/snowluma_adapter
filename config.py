@@ -188,7 +188,7 @@ class SnowLumaAdapterConfig(BaseConfig):
             depends_value=True
         )
         enable_sl_voice_to_text: bool = Field(
-            default=False,
+            default=True,
             description="是否使用 SnowLuma 原生语音转文字（fetch_ptt_text）。开启后优先通过 SnowLuma 服务端识别语音，关闭则回退到框架 ASR",
             label="SL语音转文字",
             tag="general"

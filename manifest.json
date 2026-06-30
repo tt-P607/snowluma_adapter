@@ -1,7 +1,7 @@
 {
     "name": "snowluma_adapter",
     "display_name": "SnowLuma 适配器",
-    "version": "2.0.1",
+    "version": "2.0.2",
     "description": "基于 mofox-wire 架构的 SnowLuma 适配器，为 Neo-MoFox 提供 QQ 平台消息收发能力",
     "author": "言柒",
     "license": "MIT",

@@ -23,6 +23,7 @@ from ..utils import (
     get_image_base64,
     get_member_info,
     get_message_detail,
+    get_record_detail,
     get_self_info,
 )
 
@@ -325,10 +326,14 @@ class MessageHandler:
     ) -> SegPayload | None:
         """处理语音消息。
 
-        优先使用 SnowLuma 原生 ``fetch_ptt_text`` 进行语音转文字，
-        成功则直接返回文本段；失败时返回 ``[语音]`` 占位符。
+        优先使用 SnowLuma 原生 ``fetch_ptt_text`` 进行语音转文字；
+        失败时通过 ``get_record`` 下载 WAV 并返回 voice 段，交由框架 ASR 识别；
+        均失败则返回 ``[语音]`` 占位符。
         """
         message_id = str(raw_message.get("message_id", ""))
+        segment_data = segment.get("data", {})
+        file = segment_data.get("file", "")
+        file_id = segment_data.get("file_id", "")
 
         # 检查是否启用 SnowLuma 原生语音转文字
         sl_voice_enabled = True
@@ -346,6 +351,19 @@ class MessageHandler:
                 logger.debug("SL 语音转文字返回空结果")
             except Exception as e:
                 logger.warning(f"SL 语音转文字失败: {e!s}")
+
+        # 次选：通过 get_record 下载 WAV，返回 voice 段交由框架 ASR
+        if file or file_id:
+            try:
+                record_data = await get_record_detail(file, file_id, adapter=self.adapter)
+                if record_data:
+                    base64_data = record_data.get("base64") or record_data.get("data") or ""
+                    if base64_data:
+                        logger.debug("通过 get_record 获取到语音 base64 数据，交由框架 ASR")
+                        return {"type": "voice", "data": base64_data}
+                    logger.debug("get_record 返回数据中未找到 base64 字段")
+            except Exception as e:
+                logger.warning(f"get_record 获取语音失败: {e!s}")
 
         # 兜底：返回占位符，不丢弃语音段
         return {"type": "text", "data": "[语音]"}
@@ -511,8 +529,9 @@ class MessageHandler:
             return None, 0
         for sub_message in message_list:
             sender_info: dict = sub_message.get("sender", {})
-            user_nickname: str = sender_info.get("nickname", "QQ用户")
-            user_nickname_str = f"【{user_nickname}】:"
+            user_nickname: str = sender_info.get("nickname") or sender_info.get("card") or "QQ用户"
+            user_id: str = str(sender_info.get("user_id") or "")
+            user_nickname_str = f"【{user_nickname}({user_id})】:" if user_id else f"【{user_nickname}】:"
             break_seg: SegPayload = {"type": "text", "data": "\n"}
             message_of_sub_message_list: list[dict[str, Any]] = sub_message.get("message")
             if not message_of_sub_message_list:
@@ -524,7 +543,7 @@ class MessageHandler:
                 if layer >= 3:
                     full_seg_data: SegPayload = {
                         "type": "text",
-                        "data": ("--" * layer) + f"【{user_nickname}】:【转发消息】\n",
+                        "data": ("--" * layer) + user_nickname_str + "【转发消息】\n",
                     }
                 else:
                     sub_message_data = message_of_sub_message.get("data")
@@ -538,7 +557,7 @@ class MessageHandler:
                     image_count += count
                     head_tip: SegPayload = {
                         "type": "text",
-                        "data": ("--" * layer) + f"【{user_nickname}】: 合并转发消息内容：\n",
+                        "data": ("--" * layer) + user_nickname_str + "合并转发消息内容：\n",
                     }
                     full_seg_data = {"type": "seglist", "data": [head_tip, seg_data]}
                 seg_list.append(full_seg_data)
