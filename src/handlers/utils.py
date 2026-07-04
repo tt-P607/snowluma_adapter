@@ -471,7 +471,7 @@ async def fetch_ptt_text(
 
 async def get_forward_message(
     raw_message: dict, *, adapter: "SnowLumaAdapter | None" = None
-) -> dict[str, Any] | None:
+) -> list[dict[str, Any]] | None:
     forward_message_data: dict = raw_message.get("data", {})
     if not forward_message_data:
         logger.warning("转发消息内容为空")

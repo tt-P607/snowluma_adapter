@@ -474,6 +474,9 @@ class MessageHandler:
             processed_message = handled_message
 
         forward_hint = {"type": "text", "data": "这是一条转发消息：\n"}
+        # 扁平化：将内层 seglist 内容直接展开，避免额外嵌套层级
+        if isinstance(processed_message, dict) and processed_message.get("type") == "seglist":
+            return {"type": "seglist", "data": [forward_hint, *processed_message["data"]]}  # type: ignore[return-value]
         return {"type": "seglist", "data": [forward_hint, processed_message]}  # type: ignore[return-value]
 
     async def _recursive_parse_image_seg(self, seg_data: SegPayload, to_image: bool) -> SegPayload:
@@ -533,67 +536,68 @@ class MessageHandler:
             user_id: str = str(sender_info.get("user_id") or "")
             user_nickname_str = f"【{user_nickname}({user_id})】:" if user_id else f"【{user_nickname}】:"
             break_seg: SegPayload = {"type": "text", "data": "\n"}
+            nickname_prefix = ("--" * layer) + user_nickname_str if layer > 0 else user_nickname_str
             message_of_sub_message_list: list[dict[str, Any]] = sub_message.get("message")
             if not message_of_sub_message_list:
                 logger.warning("转发消息内容为空")
                 continue
-            message_of_sub_message = message_of_sub_message_list[0]
-            message_type = message_of_sub_message.get("type")
-            if message_type == RealMessageType.forward:
-                if layer >= 3:
-                    full_seg_data: SegPayload = {
-                        "type": "text",
-                        "data": ("--" * layer) + user_nickname_str + "【转发消息】\n",
-                    }
-                else:
-                    sub_message_data = message_of_sub_message.get("data")
-                    if not sub_message_data:
+
+            # 遍历子消息中的所有消息段（支持多段消息，如"文字+图片"）
+            sub_segs: list[SegPayload] = []
+            for msg_seg in message_of_sub_message_list:
+                msg_type = msg_seg.get("type")
+                if msg_type == RealMessageType.forward:
+                    if layer >= 3:
+                        sub_segs.append({"type": "text", "data": "【转发消息】\n"})
+                    else:
+                        sub_seg_data = msg_seg.get("data")
+                        if not sub_seg_data:
+                            continue
+                        # 嵌套转发消息可能只有 id（需要再次调用 API 获取）或已有 content（内联展开）
+                        contents = sub_seg_data.get("content")
+                        if contents is None:
+                            # 嵌套转发段只有 id，调用 get_forward_msg 获取内容
+                            contents = await get_forward_message(msg_seg, adapter=self.adapter)
+                            if contents is None:
+                                logger.warning(f"嵌套转发消息获取失败(layer={layer})，使用占位符: id={sub_seg_data.get('id')}")
+                                sub_segs.append({"type": "text", "data": "【转发消息】\n"})
+                                continue
+                        seg_data_opt, count = await self._handle_forward_message(contents, layer + 1)
+                        if seg_data_opt is None:
+                            continue
+                        image_count += count
+                        # 扁平化：文本前缀 + 内层 seglist 内容直接展开到 sub_segs，避免额外嵌套层级
+                        sub_segs.append({"type": "text", "data": "合并转发消息内容：\n"})
+                        if isinstance(seg_data_opt, dict) and seg_data_opt.get("type") == "seglist":
+                            sub_segs.extend(seg_data_opt["data"])  # type: ignore[arg-type]
+                        else:
+                            sub_segs.append(seg_data_opt)
+                elif msg_type == RealMessageType.text:
+                    sub_seg_data = msg_seg.get("data")
+                    if not sub_seg_data:
                         continue
-                    contents = sub_message_data.get("content")
-                    seg_data_opt, count = await self._handle_forward_message(contents, layer + 1)
-                    if seg_data_opt is None:
+                    text_message = sub_seg_data.get("text")
+                    sub_segs.append({"type": "text", "data": text_message})
+                elif msg_type == RealMessageType.image:
+                    image_count += 1
+                    image_data = msg_seg.get("data", {})
+                    image_url = image_data.get("url")
+                    if not image_url:
+                        logger.warning("转发消息图片缺少URL")
                         continue
-                    seg_data = seg_data_opt
-                    image_count += count
-                    head_tip: SegPayload = {
-                        "type": "text",
-                        "data": ("--" * layer) + user_nickname_str + "合并转发消息内容：\n",
-                    }
-                    full_seg_data = {"type": "seglist", "data": [head_tip, seg_data]}
-                seg_list.append(full_seg_data)
-            elif message_type == RealMessageType.text:
-                sub_message_data = message_of_sub_message.get("data")
-                if not sub_message_data:
-                    continue
-                text_message = sub_message_data.get("text")
-                seg_data: SegPayload = {"type": "text", "data": text_message}
-                nickname_prefix = ("--" * layer) + user_nickname_str if layer > 0 else user_nickname_str
-                data_list: list[SegPayload] = [
-                    {"type": "text", "data": nickname_prefix},
-                    seg_data,
-                    break_seg,
-                ]
-                seg_list.append({"type": "seglist", "data": data_list})
-            elif message_type == RealMessageType.image:
-                image_count += 1
-                image_data = message_of_sub_message.get("data", {})
-                image_url = image_data.get("url")
-                if not image_url:
-                    logger.warning("转发消息图片缺少URL")
-                    continue
-                sub_type = image_data.get("sub_type")
-                if sub_type == 0:
-                    seg_data = {"type": "image", "data": image_url}
+                    sub_type = image_data.get("sub_type")
+                    if sub_type == 0:
+                        sub_segs.append({"type": "image", "data": image_url})
+                    else:
+                        sub_segs.append({"type": "emoji", "data": image_url})
                 else:
-                    seg_data = {"type": "emoji", "data": image_url}
-                nickname_prefix = ("--" * layer) + user_nickname_str if layer > 0 else user_nickname_str
-                data_list = [
-                    {"type": "text", "data": nickname_prefix},
-                    seg_data,
-                    break_seg,
-                ]
-                full_seg_data = {"type": "seglist", "data": data_list}
-                seg_list.append(full_seg_data)
+                    logger.debug(f"合并转发中未处理段类型: {msg_type}")
+
+            if sub_segs:
+                # 扁平化：将 nickname_prefix + sub_segs + break_seg 直接展开到 seg_list，避免每条子消息额外包一层 seglist
+                seg_list.append({"type": "text", "data": nickname_prefix})
+                seg_list.extend(sub_segs)
+                seg_list.append(break_seg)
         return {"type": "seglist", "data": seg_list}, image_count
 
     async def _handle_file_message(self, segment: dict) -> SegPayload | None:
