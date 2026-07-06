@@ -28,6 +28,20 @@ class MetaEventHandler:
         self._heartbeat_task: TaskInfo | None = None
         self._reconnecting = False
 
+    def _get_reconnect_interval(self) -> float:
+        """从插件配置读取重连间隔。"""
+        try:
+            if self.adapter.plugin and self.adapter.plugin.config:
+                server_cfg = getattr(self.adapter.plugin.config, "snowluma_server", None)
+                if server_cfg is not None:
+                    return float(getattr(server_cfg, "reconnect_interval", 5.0))
+        except Exception:
+            pass
+        return 5.0
+
+    # 心跳超时倍数：超过 心跳间隔 × 此倍数 未收到心跳则判定为断线
+    _HEARTBEAT_TIMEOUT_MULTIPLIER = 2.0
+
     def set_plugin_config(self, config: dict[str, Any]) -> None:
         """设置插件配置"""
         self.plugin_config = config
@@ -55,7 +69,9 @@ class MetaEventHandler:
                 self_id = raw.get("self_id")
                 self.stop_heartbeat_monitor()
                 self.last_heart_beat = time.time()
-                logger.info(f"Bot {self_id} 连接成功")
+                logger.info(
+                    f"[bold #89B4FA]Bot [bold #F9E2AF]{self_id}[/bold #F9E2AF] 连接成功[/bold #89B4FA]"
+                )
                 # 不在连接时立即启动心跳检查，等第一个心跳包到达后再启动
         elif event_type == MetaEventType.heartbeat:
             if raw["status"].get("online") and raw["status"].get("good"):
@@ -103,13 +119,20 @@ class MetaEventHandler:
         try:
             while True:
                 now_time = time.time()
-                if now_time - self.last_heart_beat > self.interval * 2:
-                    await self._reconnect_after_heartbeat_failure(
-                        id,
-                        "心跳超时",
+                if now_time - self.last_heart_beat > self.interval * self._HEARTBEAT_TIMEOUT_MULTIPLIER:
+                    logger.warning(
+                        f"[bold #FF6B6B]Bot [bold #F9E2AF]{id}[/bold #F9E2AF] 心跳超时[/bold #FF6B6B] "
+                        f"(已 {now_time - self.last_heart_beat:.0f}s 未收到心跳，"
+                        f"阈值 {self.interval * self._HEARTBEAT_TIMEOUT_MULTIPLIER:.0f}s)"
                     )
-                    break
-                await asyncio.sleep(self.interval)
+                    await self._reconnect_after_heartbeat_failure(id, "心跳超时")
+                    # 不 break，等待重连间隔后继续检查，持续监控直到恢复或适配器停止
+                    reconnect_interval = self._get_reconnect_interval()
+                    await asyncio.sleep(reconnect_interval)
+                    # 重连后重置 last_heart_beat，避免立即再次触发超时
+                    self.last_heart_beat = time.time()
+                else:
+                    await asyncio.sleep(self.interval)
         finally:
             self._interval_checking = False
             self._heartbeat_task = None

@@ -83,6 +83,16 @@ class SnowLumaAdapterConfig(BaseConfig):
             placeholder="可选，留空表示不鉴权",
             tag="security"
         )
+        reconnect_interval: float = Field(
+            default=5.0,
+            description="WebSocket 断线后重连间隔（秒）。reverse 模式下控制心跳超时后的重试频率；direct 模式下传递给 mofox-wire 的自动重连循环。",
+            label="重连间隔",
+            ge=1.0,
+            le=120.0,
+            step=1.0,
+            input_type="number",
+            tag="network"
+        )
 
     @config_section("features", title="功能特性", tag="general")
     class FeaturesSection(SectionBase):

@@ -68,6 +68,7 @@ class SnowLumaAdapter(BaseAdapter):
             access_token = config.snowluma_server.access_token
             mode_str = config.snowluma_server.mode
             ws_mode = "client" if mode_str == "direct" else "server"
+            reconnect_interval = config.snowluma_server.reconnect_interval
 
             ws_url = f"ws://{host}:{port}"
             headers = {}
@@ -77,12 +78,15 @@ class SnowLumaAdapter(BaseAdapter):
             ws_url = "ws://127.0.0.1:8095"
             headers = {}
             ws_mode = "server"
+            reconnect_interval = 5.0
 
         # 配置 WebSocket 传输
         transport = WebSocketAdapterOptions(
             mode=ws_mode,
             url=ws_url,
             headers=headers if headers else None,
+            reconnect_interval=reconnect_interval,
+            max_reconnect_attempts=None,  # 无限重连
         )
 
         super().__init__(core_sink, plugin=plugin, transport=transport, **kwargs)
@@ -100,6 +104,9 @@ class SnowLumaAdapter(BaseAdapter):
         # WebSocket 连接（用于发送 API 请求）
         # 注意：_ws 继承自 BaseAdapter，是 WebSocketLike 协议类型
         self._snowluma_ws = None  # 可选的额外连接引用
+
+        # 连接状态监控任务
+        self._conn_monitor_task: Any = None
 
         # 注册 utils 内部使用的适配器实例，便于工具方法自动获取 WS
         handler_utils.register_adapter(self)
@@ -195,11 +202,31 @@ class SnowLumaAdapter(BaseAdapter):
         # 这里不再需要调用 set_plugin_config，因为处理器会通过 adapter.plugin 访问
         logger.info("SnowLuma 适配器已加载")
 
+        # 启动连接状态监控（检测 _ws 从非 None 变为 None 的时刻）
+        self._prev_ws_connected = False
+        from src.kernel.concurrency import get_task_manager
+        tm = get_task_manager()
+        self._conn_monitor_task = tm.create_task(
+            self._connection_monitor_loop(),
+            name="snowluma_adapter_conn_monitor",
+            daemon=True,
+        )
+
     async def on_adapter_unloaded(self) -> None:
         """适配器卸载时的清理"""
         logger.info("SnowLuma 适配器正在关闭...")
 
         self.meta_event_handler.stop_heartbeat_monitor()
+
+        # 停止连接状态监控
+        monitor_task = getattr(self, "_conn_monitor_task", None)
+        if monitor_task is not None:
+            from src.kernel.concurrency import get_task_manager
+            try:
+                get_task_manager().cancel_task(monitor_task.task_id)
+            except Exception:
+                pass
+            self._conn_monitor_task = None
 
         # 清理响应池
         for future in self._response_pool.values():
@@ -208,6 +235,95 @@ class SnowLumaAdapter(BaseAdapter):
         self._response_pool.clear()
 
         logger.info("SnowLuma 适配器已关闭")
+
+    def _get_bot_id(self) -> str:
+        """从配置获取 Bot QQ 号。"""
+        try:
+            if self.plugin and self.plugin.config:
+                bot_cfg = getattr(self.plugin.config, "bot", None)
+                if bot_cfg is not None:
+                    return str(getattr(bot_cfg, "qq_id", "unknown"))
+        except Exception:
+            pass
+        return "unknown"
+
+    async def _connection_monitor_loop(self) -> None:
+        """连接状态监控循环。
+
+        定期检查 _ws 状态，在连接断开时立即打印日志。
+        检测频率高于心跳超时，让用户能更快看到断线日志。
+        """
+        import asyncio
+
+        check_interval = 3.0  # 每 3 秒检查一次
+        prev_connected = False
+
+        while True:
+            try:
+                await asyncio.sleep(check_interval)
+                current_connected = self._ws is not None and not self._ws.closed
+
+                if prev_connected and not current_connected:
+                    bot_id = self._get_bot_id()
+                    logger.warning(
+                        f"[bold #FF6B6B]SnowLuma WebSocket 连接已断开[/bold #FF6B6B] "
+                        f"[bold #F9E2AF]Bot {bot_id}[/bold #F9E2AF] "
+                        f"[#a6adc8]等待客户端重连...[/#a6adc8]"
+                    )
+
+                prev_connected = current_connected
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+
+    async def health_check(self) -> bool:
+        """健康检查。
+
+        server 模式下，只要 WebSocket 服务器仍在运行就算健康
+        （即使当前没有客户端连接，服务器也能接受新的连接）。
+        client 模式下使用父类默认的 is_connected() 判断。
+        """
+        if isinstance(self._transport_config, WebSocketAdapterOptions) and self._transport_config.mode == "server":
+            # server 模式：服务器在运行就健康，不依赖单个 ws 连接
+            return self._ws_server is not None
+        # client 模式：使用默认的连接状态检查
+        return self.is_connected()
+
+    async def reconnect(self) -> None:
+        """重连。
+
+        server 模式下不关闭 WebSocket 服务器（服务器本身能接受新连接），
+        只清理已断开的 _ws 引用，等待 SnowLuma 重新连接。
+        client 模式下使用父类默认的 stop() → start() 逻辑。
+        """
+        if isinstance(self._transport_config, WebSocketAdapterOptions) and self._transport_config.mode == "server":
+            # server 模式：只清理 _ws，不关闭服务器
+            if self._ws and not self._ws.closed:
+                try:
+                    await self._ws.close()
+                except Exception:
+                    pass
+            self._ws = None
+            # 清理响应池中等待的 Future
+            for future in self._response_pool.values():
+                if not future.done():
+                    future.cancel()
+            self._response_pool.clear()
+            # 重置心跳监控，等 SnowLuma 重连后由 lifecycle 事件重新启动
+            self.meta_event_handler.stop_heartbeat_monitor()
+            logger.info("SnowLuma server 模式重连：已清理旧连接，等待 SnowLuma 重新连接")
+            return
+
+        # client 模式：使用父类默认的 stop() → start() 逻辑
+        await self.stop()
+        if self.plugin and self.plugin.config:
+            config = cast(SnowLumaAdapterConfig, self.plugin.config)
+            interval = config.snowluma_server.reconnect_interval
+        else:
+            interval = 5.0
+        await asyncio.sleep(interval)
+        await self.start()
 
     async def from_platform_message(self, raw: dict[str, Any]) -> MessageEnvelope | None:  # type: ignore[override]
         """
