@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+import httpx
 import orjson
-from mofox_wire import MessageBuilder, SegPayload
+from mofox_wire import MessageBuilder, MessageEnvelope, SegPayload
 from mofox_wire.types import UserRole
 
 from src.app.plugin_system.api.log_api import get_logger
@@ -38,36 +40,8 @@ class MessageHandler:
 
     def __init__(self, adapter: "SnowLumaAdapter"):
         self.adapter = adapter
-        self._video_downloader = None
 
-    def _get_video_io_timeout(self) -> float:
-        """获取视频 IO 相关操作的超时时间。"""
-        default_timeout = 30.0
-        if not self.adapter.plugin or not self.adapter.plugin.config:
-            return default_timeout
-
-        config = cast(SnowLumaAdapterConfig, self.adapter.plugin.config)
-        return max(1.0, float(config.features.video_download_timeout))
-    
-    def _init_video_downloader(self) -> None:
-        """根据配置初始化视频下载器"""
-        # 通过 adapter.plugin 访问配置
-        if not self.adapter.plugin or not self.adapter.plugin.config:
-            return
-
-        config = cast(SnowLumaAdapterConfig, self.adapter.plugin.config)
-
-        # 如果启用了视频处理，根据配置初始化视频下载器
-        if config.features.enable_video_processing:
-            from ..video_handler import VideoDownloader
-
-            max_size = config.features.video_max_size_mb
-            timeout = config.features.video_download_timeout
-
-            self._video_downloader = VideoDownloader(max_size_mb=max_size, download_timeout=timeout)
-            logger.debug(f"视频下载器已初始化: max_size={max_size}MB, timeout={timeout}s")
-
-    async def handle_raw_message(self, raw: dict[str, Any]):
+    async def handle_raw_message(self, raw: dict[str, Any]) -> MessageEnvelope | None:
         """
         处理原始消息并转换为 MessageEnvelope
 
@@ -88,15 +62,17 @@ class MessageHandler:
 
         msg_builder = MessageBuilder()
 
-        # 构造用户信息
+        # 构造用户信息（不修改原始 raw 数据）
         sender_info = raw.get("sender", {})
-        role = sender_info.get("role", "")
-        if role == "owner":
-            sender_info["role"] = UserRole.OWNER
-        elif role == "admin":
-            sender_info["role"] = UserRole.OPERATOR
-        elif role == "member":
-            sender_info["role"] = UserRole.MEMBER
+        role_str = sender_info.get("role", "")
+        if role_str == "owner":
+            role = UserRole.OWNER
+        elif role_str == "admin":
+            role = UserRole.OPERATOR
+        elif role_str == "member":
+            role = UserRole.MEMBER
+        else:
+            role = role_str
 
         (
             msg_builder.direction("incoming")
@@ -108,7 +84,7 @@ class MessageHandler:
                 nickname=sender_info.get("nickname", ""),
                 cardname=sender_info.get("card", ""),
                 user_avatar=sender_info.get("avatar", ""),
-                role=sender_info.get("role", ""),
+                role=role,
             )
         )
 
@@ -133,10 +109,30 @@ class MessageHandler:
         message_segments = raw.get("message", [])
         seg_list: list[SegPayload] = []
 
+        # 提取引用回复的目标消息 ID（用于填充 reply_to）
+        reply_target_id: str | None = None
+        reply_target_sender_id: str | None = None
+
         for segment in message_segments:
+            # 检测 reply 段，提取被回复消息的 ID
+            if isinstance(segment, dict) and segment.get("type") == "reply":
+                reply_seg_data = segment.get("data", {})
+                if isinstance(reply_seg_data, dict):
+                    reply_target_id = str(reply_seg_data.get("id", "")) or None
+
             seg_message = await self.handle_single_segment(segment, raw)
             if seg_message:
                 seg_list.append(seg_message)
+
+        # 如果检测到引用回复，获取被回复消息的发送者 ID
+        if reply_target_id:
+            try:
+                reply_detail = await get_message_detail(reply_target_id)
+                if reply_detail:
+                    reply_sender = reply_detail.get("sender", {})
+                    reply_target_sender_id = str(reply_sender.get("user_id", "")) or None
+            except Exception:
+                pass
 
         # 防御性检查：确保至少有一个消息段，避免消息为空导致构建失败
         if not seg_list:
@@ -149,6 +145,13 @@ class MessageHandler:
         )
 
         msg_builder.seg_list(seg_list)
+
+        # 通过 metadata 传递 reply_to 信息给框架
+        if reply_target_id:
+            reply_meta: dict[str, Any] = {"reply_to": reply_target_id}
+            if reply_target_sender_id:
+                reply_meta["reply_target_sender_id"] = reply_target_sender_id
+            msg_builder.metadata(reply_meta)
 
         return msg_builder.build()
 
@@ -182,13 +185,11 @@ class MessageHandler:
                 return await self._handle_record_message(segment, raw_message)
             case RealMessageType.video:
                 # 检查是否启用了视频处理
-                if (
-                    self.adapter.plugin
-                    and self.adapter.plugin.config
-                    and not self.adapter.plugin.config.features.enable_video_processing  # type: ignore[attr-defined]
-                ):
-                    logger.debug("视频消息处理已禁用，跳过")
-                    return {"type": "text", "data": "[视频消息]"}
+                if self.adapter.plugin and self.adapter.plugin.config:
+                    config = cast(SnowLumaAdapterConfig, self.adapter.plugin.config)
+                    if not config.features.enable_video_processing:
+                        logger.debug("视频消息处理已禁用，跳过")
+                        return {"type": "text", "data": "[视频消息]"}
                 return await self._handle_video_message(segment)
             case RealMessageType.rps:
                 return await self._handle_rps_message(segment)
@@ -202,6 +203,8 @@ class MessageHandler:
                 return await self.handle_forward_message(messages)  # type: ignore[arg-type]
             case RealMessageType.json:
                 return await self._handle_json_message(segment)
+            case RealMessageType.contact:
+                return await self._handle_contact_message(segment)
             case RealMessageType.file:
                 return await self._handle_file_message(segment)
 
@@ -239,9 +242,8 @@ class MessageHandler:
             return None
 
         try:
-            async with asyncio.timeout(10): # 兜底超时处理
-                image_base64 = await get_image_base64(image_url)
-        except TimeoutError:
+            image_base64 = await get_image_base64(image_url)
+        except httpx.TimeoutException:
             logger.error(f"图片消息处理超时: {image_url}")
             return {"type": "text", "data": "[图片处理超时]"}
         except Exception as e:
@@ -380,10 +382,20 @@ class MessageHandler:
             logger.warning("视频消息缺少URL或文件路径信息")
             return {"type": "text", "data": "[视频消息]"}
 
+        # 从配置读取视频处理参数
+        io_timeout = 30.0
+        max_size_mb = 100
+        download_timeout = 60
+        if self.adapter.plugin and self.adapter.plugin.config:
+            config = cast(SnowLumaAdapterConfig, self.adapter.plugin.config)
+            io_timeout = max(1.0, float(config.features.video_download_timeout))
+            max_size_mb = config.features.video_max_size_mb
+            download_timeout = config.features.video_download_timeout
+
         try:
             if file_path and Path(file_path).exists():
                 # 本地文件处理
-                async with asyncio.timeout(self._get_video_io_timeout()):
+                async with asyncio.timeout(io_timeout):
                     video_data = await asyncio.to_thread(Path(file_path).read_bytes)
                 video_base64 = await asyncio.to_thread(
                     base64_encode_bytes,
@@ -400,11 +412,12 @@ class MessageHandler:
                     },
                 }
             elif video_url:
-                # URL下载处理 - 使用配置中的下载器实例
-                downloader = self._video_downloader
-                if not downloader:
-                    from ..video_handler import get_video_downloader
-                    downloader = get_video_downloader()
+                # URL下载处理 - 使用配置参数创建下载器
+                from ..video_handler import VideoDownloader
+                downloader = VideoDownloader(
+                    max_size_mb=max_size_mb,
+                    download_timeout=download_timeout,
+                )
 
                 download_result = await downloader.download_video(video_url)
 
@@ -453,11 +466,15 @@ class MessageHandler:
         return {"type": "text", "data": f"[扔了一个骰子，点数是{res}]"}
 
 
-    async def handle_forward_message(self, message_list: list) -> SegPayload | None:
+    async def handle_forward_message(self, message_list: list[dict[str, Any]]) -> SegPayload | None:
         """
         递归处理转发消息，并按照动态方式确定图片处理方式
-        Parameters:
-            message_list: list: 转发消息列表
+
+        Args:
+            message_list: 转发消息列表
+
+        Returns:
+            处理后的消息段，失败返回 None
         """
         handled_message, image_count = await self._handle_forward_message(message_list, 0)
         if not handled_message:
@@ -479,7 +496,9 @@ class MessageHandler:
             return {"type": "seglist", "data": [forward_hint, *processed_message["data"]]}  # type: ignore[return-value]
         return {"type": "seglist", "data": [forward_hint, processed_message]}  # type: ignore[return-value]
 
-    async def _recursive_parse_image_seg(self, seg_data: SegPayload, to_image: bool) -> SegPayload:
+    async def _recursive_parse_image_seg(
+        self, seg_data: SegPayload, to_image: bool
+    ) -> SegPayload:
         # sourcery skip: merge-else-if-into-elif
         if seg_data.get("type") == "seglist":
             new_seg_list = []
@@ -515,7 +534,9 @@ class MessageHandler:
         logger.debug(f"不处理类型: {seg_data.get('type')}")
         return seg_data
 
-    async def _handle_forward_message(self, message_list: list, layer: int) -> tuple[SegPayload | None, int]:
+    async def _handle_forward_message(
+        self, message_list: list[dict[str, Any]] | None, layer: int
+    ) -> tuple[SegPayload | None, int]:
         # sourcery skip: low-code-quality
         """
         递归处理实际转发消息
@@ -537,7 +558,7 @@ class MessageHandler:
             user_nickname_str = f"【{user_nickname}({user_id})】:" if user_id else f"【{user_nickname}】:"
             break_seg: SegPayload = {"type": "text", "data": "\n"}
             nickname_prefix = ("--" * layer) + user_nickname_str if layer > 0 else user_nickname_str
-            message_of_sub_message_list: list[dict[str, Any]] = sub_message.get("message")
+            message_of_sub_message_list: list[dict[str, Any]] = sub_message.get("message", [])
             if not message_of_sub_message_list:
                 logger.warning("转发消息内容为空")
                 continue
@@ -599,6 +620,35 @@ class MessageHandler:
                 seg_list.extend(sub_segs)
                 seg_list.append(break_seg)
         return {"type": "seglist", "data": seg_list}, image_count
+
+    async def _handle_contact_message(self, segment: dict) -> SegPayload | None:
+        """处理推荐名片/群名片消息（OneBot v11 contact 段）。
+
+        OneBot v11 的 ``contact`` 段有 ``type`` 字段区分 ``qq``（个人名片）和 ``group``（群名片），
+        data 中包含 ``user_id``/``nickname`` 或 ``group_id``/``group_name``。
+        """
+        message_data = segment.get("data", {})
+        if not message_data:
+            logger.warning("名片消息缺少 data 字段")
+            return None
+
+        contact_type = message_data.get("type", "qq")
+        if contact_type == "group":
+            group_id = message_data.get("group_id", "")
+            group_name = message_data.get("group_name") or message_data.get("name", "")
+            logger.debug(f"收到群名片: id={group_id}, name={group_name}")
+            if not group_id and not group_name:
+                logger.warning("群名片消息缺少 group_id 和 group_name")
+                return None
+            return {"type": "text", "data": f"[群名片：{group_name}({group_id})]"}
+        else:
+            user_id = message_data.get("user_id", "")
+            nickname = message_data.get("nickname") or message_data.get("name", "")
+            logger.debug(f"收到个人名片: id={user_id}, name={nickname}")
+            if not user_id and not nickname:
+                logger.warning("个人名片消息缺少 user_id 和 nickname")
+                return None
+            return {"type": "text", "data": f"[个人名片：{nickname}({user_id})]"}
 
     async def _handle_file_message(self, segment: dict) -> SegPayload | None:
         """处理文件消息"""
@@ -763,6 +813,75 @@ class MessageHandler:
                     )
                     return {"type": "text", "data": formatted_content}
 
+            # 检查是否是名片分享卡片 (com.tencent.contact.lua)
+            # 群名片和个人名片都使用此 app 类型，通过 bizsrc / tag 区分
+            if "com.tencent.contact" in str(nested_data.get("app", "")):
+                logger.debug("检测到名片JSON消息，开始提取信息")
+                meta = nested_data.get("meta", {})
+                contact = meta.get("contact", {})
+                if not contact:
+                    logger.warning("名片JSON缺少 meta.contact 字段")
+                    return None
+
+                bizsrc = str(nested_data.get("bizsrc", ""))
+                tag = str(contact.get("tag", ""))
+                nickname = contact.get("nickname", "") or contact.get("name", "")
+                jump_url = str(contact.get("jumpUrl", ""))
+                legacy_url = str(contact.get("legacyUrl", ""))
+
+                # 判断是群名片还是个人名片：
+                # 群名片 bizsrc="qun.share"，jumpUrl 含 card_type=group，legacyUrl 含 group_code=
+                is_group_card = (
+                    bizsrc == "qun.share"
+                    or "card_type=group" in jump_url
+                    or "group_code=" in legacy_url
+                    or tag == "群名片"
+                )
+
+                if is_group_card:
+                    logger.debug(f"识别为群名片: nickname={nickname}")
+                    # 从 legacyUrl 提取 group_code，从 jumpUrl 提取 uin
+                    group_id = ""
+                    if "group_code=" in legacy_url:
+                        group_id = self._extract_param(legacy_url, "group_code")
+                    if not group_id and "uin=" in jump_url:
+                        group_id = self._extract_param(jump_url, "uin")
+                    group_memo = contact.get("contact", "")
+
+                    parts = []
+                    if nickname:
+                        parts.append(f"群名: {nickname}")
+                    if group_id:
+                        parts.append(f"群号: {group_id}")
+                    if group_memo:
+                        parts.append(f"简介: {group_memo}")
+                    return {
+                        "type": "text",
+                        "data": f"这是一条群名片分享消息\n{chr(10).join(parts)}",
+                    }
+                else:
+                    logger.debug(f"识别为个人名片: nickname={nickname}")
+                    # 从 contact 字段 "账号：1936860600" 或 jumpUrl 的 uin 提取 user_id
+                    user_id = ""
+                    contact_text = str(contact.get("contact", ""))
+                    if "账号" in contact_text:
+                        # 提取冒号后的数字
+                        match = re.search(r"(\d+)", contact_text)
+                        if match:
+                            user_id = match.group(1)
+                    if not user_id and "uin=" in jump_url:
+                        user_id = self._extract_param(jump_url, "uin")
+
+                    parts = []
+                    if nickname:
+                        parts.append(f"昵称: {nickname}")
+                    if user_id:
+                        parts.append(f"QQ号: {user_id}")
+                    return {
+                        "type": "text",
+                        "data": f"这是一条个人名片分享消息\n{chr(10).join(parts)}",
+                    }
+
             # 如果没有提取到关键信息，返回None
             return None
 
@@ -774,6 +893,24 @@ class MessageHandler:
         except Exception as e:
             logger.error(f"处理JSON消息时发生未知错误: {e}")
             return None
+
+    @staticmethod
+    def _extract_param(url: str, param: str) -> str:
+        """从 URL 查询字符串中提取指定参数值。
+
+        Args:
+            url: 包含查询参数的 URL 字符串
+            param: 要提取的参数名
+
+        Returns:
+            参数值字符串，未找到时返回空字符串
+        """
+        if not url or not param:
+            return ""
+        # 用正则提取 param=value，值匹配到 & 或字符串末尾或 # 之前
+        pattern = rf"{re.escape(param)}=([^&#]+)"
+        match = re.search(pattern, url)
+        return match.group(1) if match else ""
 
     def _is_file_upload_echo(self, nested_data: Any) -> bool:
         """检查一个JSON对象是否是机器人自己上传文件的回声消息"""
