@@ -1052,24 +1052,42 @@ class NoticeHandler:
             int(group_id) if group_id else 0, int(user_id) if user_id else 0
         )
         if member_info:
-            user_nickname = member_info.get("card") or member_info.get("nickname", "QQ用户")
+            user_nickname = member_info.get("card") or member_info.get("nickname", "") or "QQ用户"
         else:
-            # 退群后查不到群成员信息，尝试获取陌生人信息
-            stranger_info: dict | None = await get_stranger_info(user_id)
+            # 退群后成员已不在群中，改用陌生人信息接口获取昵称
+            stranger_info: dict | None = await get_stranger_info(
+                int(user_id) if user_id else 0
+            )
             if stranger_info:
-                user_nickname = stranger_info.get("nickname", "QQ用户")
-            logger.debug("退群者已不在群中，使用陌生人信息")
+                user_nickname = stranger_info.get("nickname", "") or "QQ用户"
+            logger.debug("退群者已退群，通过陌生人信息接口获取昵称")
 
-        # 获取操作者信息
+        # 拼接退群者显示名（昵称 + QQ号）
+        user_display: str = f" {user_nickname}({user_id}) " if user_id else f" {user_nickname} "
+
+        # 获取操作者信息（含群角色）
         operator_name: str = "QQ用户"
+        operator_role: str = ""
         if sub_type in ("kick", "kick_me") and operator_id:
             op_info: dict | None = await get_member_info(
                 int(group_id) if group_id else 0, int(operator_id) if operator_id else 0
             )
             if op_info:
-                operator_name = op_info.get("card") or op_info.get("nickname", "QQ用户")
+                operator_name = op_info.get("card") or op_info.get("nickname", "") or "QQ用户"
+                op_role_raw = op_info.get("role", "")
+                if op_role_raw == "owner":
+                    operator_role = "群主"
+                elif op_role_raw == "admin":
+                    operator_role = "管理员"
         else:
             operator_name = user_nickname
+
+        # 拼接操作者显示名（角色 + 昵称 + QQ号）
+        if sub_type in ("kick", "kick_me") and operator_id:
+            role_prefix = f"{operator_role}" if operator_role else ""
+            operator_display = f" {role_prefix}{operator_name}({operator_id}) "
+        else:
+            operator_display = f" {operator_name} "
 
         user_info: UserInfoPayload = {
             "platform": "qq",
@@ -1080,13 +1098,13 @@ class NoticeHandler:
         }
 
         if sub_type == "leave":
-            action_text = f"{user_nickname}主动退出了本群"
+            action_text = f"{user_display}主动退出了本群"
         elif sub_type == "kick":
-            action_text = f"{user_nickname}被{operator_name}踢出了本群"
+            action_text = f"{user_display}被{operator_display}踢出了本群"
         elif sub_type == "kick_me":
-            action_text = f"Bot被{operator_name}踢出了群"
+            action_text = f"Bot被{operator_display}踢出了群"
         else:
-            action_text = f"{user_nickname}离开了本群"
+            action_text = f"{user_display}离开了本群"
 
         seg_data: SegPayload = {
             "type": "text",

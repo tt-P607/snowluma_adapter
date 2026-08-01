@@ -288,9 +288,11 @@ class MessageHandler:
         以便框架 ``MessageConverter`` 解析出 ``Message.reply_to``；其后保留
         可读的 ``[回复<昵称(QQ号)>：...]`` 文本预览。
 
-        与 onebot 适配器不同，本方法通过查数据库 ``processed_plain_text`` 获取
-        被引用消息的已识别内容（含 VLM/ASR 识别结果），而非 ``get_message_detail``
-        的原始段，避免媒体消息只有 ``[图片]`` 占位符而无识别描述。
+        被引用消息的内容与发送者信息通过 :meth:`_resolve_reply_info` 获取：
+        优先查数据库 ``processed_plain_text``（含 VLM/ASR 识别结果），
+        查不到时 fallback 到 ``get_message_detail`` API 向 SnowLuma 服务端
+        获取原始消息详情，避免数据库未命中时回退为
+        ``[无法获取被引用的消息]`` 占位。
         """
         if in_reply:
             return None
@@ -303,17 +305,56 @@ class MessageHandler:
         if not message_id:
             return None
 
-        # 查数据库获取被引用消息的已识别内容
+        reply_text, sender_nickname, sender_id_str = await self._resolve_reply_info(
+            str(message_id), raw_message
+        )
+
+        prefix_text = f"[回复<{sender_nickname}({sender_id_str})>：" if sender_id_str else f"[回复<{sender_nickname}>："
+        suffix_text = "]，说："
+
+        # 被引用消息内容为空时的占位
+        brief_text = reply_text or "[无法获取被引用的消息]"
+
+        return {
+            "type": "seglist",
+            "data": [
+                {"type": "reply", "data": str(message_id)},
+                {"type": "text", "data": prefix_text},
+                {"type": "text", "data": brief_text},
+                {"type": "text", "data": suffix_text},
+            ],
+        }
+
+    async def _resolve_reply_info(
+        self,
+        message_id: str,
+        raw_message: dict,
+    ) -> tuple[str, str, str]:
+        """获取被引用消息的内容与发送者信息。
+
+        优先查数据库 ``processed_plain_text``（含 VLM/ASR 识别结果），
+        查不到时 fallback 到 ``get_message_detail`` API 向 SnowLuma 服务端
+        获取原始消息详情，从中提取发送者信息和消息内容预览。
+
+        Args:
+            message_id: 被引用消息 ID。
+            raw_message: 当前消息的原始数据，用于提取 ``self_id``。
+
+        Returns:
+            tuple: ``(reply_text, sender_nickname, sender_id_str)``。
+        """
         reply_text = ""
         sender_nickname = "未知用户"
         sender_id_str = ""
+
+        # 优先查数据库
         try:
             from src.core.models.sql_alchemy import Messages, PersonInfo
             from src.kernel.db import QueryBuilder
 
             msg_record = cast(Messages | None, await (
                 QueryBuilder(Messages)
-                .filter(message_id=str(message_id))
+                .filter(message_id=message_id)
                 .first()
             ))
             if msg_record:
@@ -340,21 +381,83 @@ class MessageHandler:
         except Exception as e:
             logger.warning(f"查询被引用消息记录失败: {e!s}")
 
-        prefix_text = f"[回复<{sender_nickname}({sender_id_str})>：" if sender_id_str else f"[回复<{sender_nickname}>："
-        suffix_text = "]，说："
+        # 数据库查到了完整内容与发送者，直接返回
+        if reply_text and sender_id_str:
+            return reply_text, sender_nickname, sender_id_str
 
-        # 被引用消息内容为空时的占位
-        brief_text = reply_text or "[无法获取被引用的消息]"
+        # fallback: 通过 get_message_detail 获取原始消息详情
+        try:
+            msg_detail = await get_message_detail(message_id)
+            if not msg_detail:
+                return reply_text, sender_nickname, sender_id_str
 
-        return {
-            "type": "seglist",
-            "data": [
-                {"type": "reply", "data": str(message_id)},
-                {"type": "text", "data": prefix_text},
-                {"type": "text", "data": brief_text},
-                {"type": "text", "data": suffix_text},
-            ],
-        }
+            # 补充发送者信息（数据库未查到时）
+            if not sender_id_str:
+                sender_info = msg_detail.get("sender", {})
+                detail_sender_id = sender_info.get("user_id")
+                self_id = raw_message.get("self_id")
+
+                if detail_sender_id and self_id and str(detail_sender_id) == str(self_id):
+                    sender_nickname = "你"
+                    sender_id_str = str(detail_sender_id)
+                else:
+                    detail_nickname = sender_info.get("nickname") or ""
+                    if detail_nickname:
+                        sender_nickname = detail_nickname
+                    if detail_sender_id:
+                        sender_id_str = str(detail_sender_id)
+
+            # 补充消息内容（数据库未查到时）
+            if not reply_text:
+                reply_text = self._extract_reply_preview(msg_detail)
+        except Exception as e:
+            logger.debug(f"获取被引用消息详情失败: {e!s}")
+
+        return reply_text, sender_nickname, sender_id_str
+
+    @staticmethod
+    def _extract_reply_preview(message_detail: dict, depth: int = 0) -> str:
+        """从原始消息详情中提取可读文本预览。
+
+        Args:
+            message_detail: ``get_message_detail`` 返回的消息详情。
+            depth: 嵌套深度，防止无限递归。
+
+        Returns:
+            str: 可读文本预览；深度超限返回 ``...``。
+        """
+        if depth > 3:
+            return "..."
+
+        parts: list[str] = []
+        for seg in message_detail.get("message", []):
+            seg_type = seg.get("type")
+            seg_data = seg.get("data", {})
+
+            if seg_type == RealMessageType.text:
+                parts.append(seg_data.get("text", ""))
+            elif seg_type == RealMessageType.face:
+                face_id = str(seg_data.get("id", ""))
+                parts.append(QQ_FACE.get(face_id, f"[表情{face_id}]"))
+            elif seg_type == RealMessageType.image:
+                parts.append("[图片]" if seg_data.get("sub_type") == 0 else "[表情包]")
+            elif seg_type == RealMessageType.at:
+                at_name = seg_data.get("text") or seg_data.get("qq") or "未知对象"
+                parts.append(f"@{at_name}")
+            elif seg_type == RealMessageType.reply:
+                reply_id = seg_data.get("id")
+                if reply_id:
+                    # 嵌套回复只取文本预览，不再调用 API 避免性能问题
+                    parts.append("[回复消息]")
+            elif seg_type == RealMessageType.forward:
+                parts.append("[转发消息]")
+            elif seg_type == RealMessageType.file:
+                file_name = seg_data.get("file") or seg_data.get("name") or "文件"
+                parts.append(f"[文件:{file_name}]")
+            elif seg_type == RealMessageType.record:
+                parts.append("[语音]")
+
+        return "".join(parts).strip()
 
     async def _handle_record_message(
         self, segment: dict, raw_message: dict
