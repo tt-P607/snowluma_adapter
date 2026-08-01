@@ -34,6 +34,10 @@ class NoticeType:  # 通知事件
     group_ban = "group_ban"  # 群禁言
     group_msg_emoji_like = "group_msg_emoji_like"  # 群聊表情回复
     group_upload = "group_upload"  # 群文件上传
+    group_increase = "group_increase"  # 群成员增加
+    group_decrease = "group_decrease"  # 群成员减少
+    group_admin = "group_admin"  # 群管理员变动
+    essence = "essence"  # 精华消息
 
     class Notify:
         poke = "poke"  # 戳一戳
@@ -42,6 +46,23 @@ class NoticeType:  # 通知事件
     class GroupBan:
         ban = "ban"  # 禁言
         lift_ban = "lift_ban"  # 解除禁言
+
+    class GroupIncrease:
+        approve = "approve"  # 审批通过
+        invite = "invite"  # 被邀请
+
+    class GroupDecrease:
+        leave = "leave"  # 主动退群
+        kick = "kick"  # 被踢
+        kick_me = "kick_me"  # Bot 被踢
+
+    class GroupAdmin:
+        set = "set"  # 设置管理员
+        unset = "unset"  # 取消管理员
+
+    class Essence:
+        add = "add"  # 设置精华
+        delete = "delete"  # 移除精华
 
 
 class RealMessageType:  # 实际消息分类

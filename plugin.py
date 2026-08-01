@@ -20,6 +20,7 @@ from mofox_wire import CoreSink, MessageEnvelope, WebSocketAdapterOptions
 
 from src.app.plugin_system.api.log_api import get_logger
 from src.core.components.base import BaseAdapter, BasePlugin
+from src.core.components.types import PlatformSendResult
 from src.core.components.loader import register_plugin
 
 from .config import SnowLumaAdapterConfig
@@ -28,7 +29,6 @@ from .src.handlers.to_core.message_handler import MessageHandler
 from .src.handlers.to_core.meta_event_handler import MetaEventHandler
 from .src.handlers.to_core.notice_handler import NoticeHandler
 from .src.handlers.to_snowluma.send_handler import SendHandler
-
 logger = get_logger("snowluma_adapter")
 
 
@@ -50,10 +50,10 @@ def _validate_bot_identity(config: SnowLumaAdapterConfig) -> None:
 class SnowLumaAdapter(BaseAdapter):
     """SnowLuma 适配器 - 完全基于 mofox-wire 架构"""
 
-    adapter_name = "snowluma_adapter"
+    name = "snowluma_adapter"
     adapter_version = "2.0.0"
     adapter_author = "MoFox Team"
-    adapter_description = "基于 MoFox-Bus 的 SnowLuma 11 适配器"
+    description = "基于 MoFox-Bus 的 SnowLuma 11 适配器"
     platform = "qq"
 
     run_in_subprocess = False
@@ -376,17 +376,24 @@ class SnowLumaAdapter(BaseAdapter):
             logger.error(f"处理 SnowLuma 事件失败: {e}, 原始数据: {raw}")
             return None
 
-    async def _send_platform_message(self, envelope: MessageEnvelope) -> None:  # type: ignore[override]
+    async def _send_platform_message(self, envelope: MessageEnvelope) -> PlatformSendResult:  # type: ignore[override]
         """
         将 MessageEnvelope 转换并发送到 SnowLuma
 
         这里不直接通过 WebSocket 发送 envelope，
         而是调用 SnowLuma API（send_group_msg, send_private_msg 等）
+
+        Returns:
+            PlatformSendResult: 发送结果，包含成功/失败状态与平台消息 ID
         """
         try:
-            await self.send_handler.handle_message(envelope)
+            message_id = await self.send_handler.handle_message(envelope)
+            if message_id:
+                return PlatformSendResult(success=True, message_id=message_id)
+            return PlatformSendResult(success=True)
         except Exception as e:
             logger.error(f"发送 SnowLuma 消息失败: {e}")
+            return PlatformSendResult(success=False, error=str(e))
 
     async def send_snowluma_api(self, action: str, params: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]:
         """
@@ -469,7 +476,6 @@ class SnowLumaAdapterPlugin(BasePlugin):
     """SnowLuma 适配器插件"""
 
     plugin_name = "snowluma_adapter"
-    plugin_version = "2.0.0"
     plugin_author = "MoFox Team"
     plugin_description = "SnowLuma 11 适配器（基于 Neo-MoFox 重写）"
     configs: list[type] = [SnowLumaAdapterConfig]

@@ -27,6 +27,7 @@ from ..utils import (
     get_message_detail,
     get_record_detail,
     get_self_info,
+    sanitize_text,
 )
 
 if TYPE_CHECKING:
@@ -81,8 +82,8 @@ class MessageHandler:
             .from_user(
                 user_id=str(sender_info.get("user_id", "")),
                 platform="qq",
-                nickname=sender_info.get("nickname", ""),
-                cardname=sender_info.get("card", ""),
+                nickname=sanitize_text(sender_info.get("nickname", "")),
+                cardname=sanitize_text(sender_info.get("card", "")),
                 user_avatar=sender_info.get("avatar", ""),
                 role=role,
             )
@@ -281,7 +282,16 @@ class MessageHandler:
                 return None
 
     async def _handle_reply_message(self, segment: dict, raw_message: dict, in_reply: bool) -> SegPayload | None:
-        """处理回复消息"""
+        """处理回复消息。
+
+        返回的 seglist 会前置一个 ``reply`` 段（data 为被引用消息 ID），
+        以便框架 ``MessageConverter`` 解析出 ``Message.reply_to``；其后保留
+        可读的 ``[回复<昵称(QQ号)>：...]`` 文本预览。
+
+        与 onebot 适配器不同，本方法通过查数据库 ``processed_plain_text`` 获取
+        被引用消息的已识别内容（含 VLM/ASR 识别结果），而非 ``get_message_detail``
+        的原始段，避免媒体消息只有 ``[图片]`` 占位符而无识别描述。
+        """
         if in_reply:
             return None
 
@@ -293,34 +303,57 @@ class MessageHandler:
         if not message_id:
             return None
 
-        message_detail = await get_message_detail(message_id)
-        if not message_detail:
-            logger.warning("获取被引用的消息详情失败")
-            return {"type": "text", "data": "[无法获取被引用的消息]"}
+        # 查数据库获取被引用消息的已识别内容
+        reply_text = ""
+        sender_nickname = "未知用户"
+        sender_id_str = ""
+        try:
+            from src.core.models.sql_alchemy import Messages, PersonInfo
+            from src.kernel.db import QueryBuilder
 
-        # 递归处理被引用的消息
-        reply_segments: list[SegPayload] = []
-        for reply_seg in message_detail.get("message", []):
-            if isinstance(reply_seg, dict):
-                reply_result = await self.handle_single_segment(reply_seg, raw_message, in_reply=True)
-                if reply_result:
-                    reply_segments.append(reply_result)
+            msg_record = cast(Messages | None, await (
+                QueryBuilder(Messages)
+                .filter(message_id=str(message_id))
+                .first()
+            ))
+            if msg_record:
+                reply_text = msg_record.processed_plain_text or ""
+                person_id = msg_record.person_id
 
-        sender_info = message_detail.get("sender", {})
-        sender_nickname = sender_info.get("nickname") or "未知用户"
-        sender_id = sender_info.get("user_id")
+                # Bot 消息 person_id 为 "bot"
+                if person_id == "bot":
+                    self_id = raw_message.get("self_id")
+                    sender_nickname = "你"
+                    sender_id_str = str(self_id) if self_id else ""
+                elif person_id:
+                    person_record = cast(PersonInfo | None, await (
+                        QueryBuilder(PersonInfo)
+                        .filter(person_id=person_id)
+                        .first()
+                    ))
+                    if person_record:
+                        nickname = person_record.nickname or ""
+                        cardname = person_record.cardname or ""
+                        sender_id_str = person_record.user_id or ""
+                        # 优先使用群名片
+                        sender_nickname = cardname or nickname or "未知用户"
+        except Exception as e:
+            logger.warning(f"查询被引用消息记录失败: {e!s}")
 
-        prefix_text = f"[回复<{sender_nickname}({sender_id})>：" if sender_id else f"[回复<{sender_nickname}>："
+        prefix_text = f"[回复<{sender_nickname}({sender_id_str})>：" if sender_id_str else f"[回复<{sender_nickname}>："
         suffix_text = "]，说："
 
-        # 将被引用的消息段落转换为可读的文本占位，避免嵌套的 base64 污染
-        brief_segments = [
-            {"type": seg.get("type", "text"), "data": seg.get("data", "")} for seg in reply_segments
-        ] or [{"type": "text", "data": "[无法获取被引用的消息]"}]
+        # 被引用消息内容为空时的占位
+        brief_text = reply_text or "[无法获取被引用的消息]"
 
-        return {  # type: ignore[return-value]
+        return {
             "type": "seglist",
-            "data": [{"type": "text", "data": prefix_text}, *brief_segments, {"type": "text", "data": suffix_text}],
+            "data": [
+                {"type": "reply", "data": str(message_id)},
+                {"type": "text", "data": prefix_text},
+                {"type": "text", "data": brief_text},
+                {"type": "text", "data": suffix_text},
+            ],
         }
 
     async def _handle_record_message(
@@ -330,12 +363,56 @@ class MessageHandler:
 
         优先使用 SnowLuma 原生 ``fetch_ptt_text`` 进行语音转文字；
         失败时通过 ``get_record`` 下载 WAV 并返回 voice 段，交由框架 ASR 识别；
-        均失败则返回 ``[语音]`` 占位符。
+        均失败则返回 ``[语音(识别失败)]`` 占位符。
+
+        在语音消息识别成功后，会向当前聊天流注入一条提示词，
+        提醒 LLM 注意语音识别结果可能存在同音/近形字错误。
         """
         message_id = str(raw_message.get("message_id", ""))
         segment_data = segment.get("data", {})
         file = segment_data.get("file", "")
         file_id = segment_data.get("file_id", "")
+
+        def _inject_voice_hint() -> None:
+            """向当前流注入一条 once 语音提示词，框架消费后自动从 store 删除。"""
+            try:
+                from src.app.plugin_system.api.prompt_api import add_stream_reminder
+                from src.core.prompt import (
+                    SystemReminderInsertType,
+                    SystemReminderConsumeType,
+                )
+                from src.core.models.stream import ChatStream
+
+                msg_type = raw_message.get("message_type")
+                group_id = raw_message.get("group_id")
+                sender_info = raw_message.get("sender", {})
+                user_id = sender_info.get("user_id", "")
+
+                if msg_type == "group" and group_id:
+                    stream_id = ChatStream.generate_stream_id(
+                        platform="qq", group_id=str(group_id)
+                    )
+                else:
+                    stream_id = ChatStream.generate_stream_id(
+                        platform="qq", user_id=str(user_id)
+                    )
+
+                add_stream_reminder(
+                    stream_id=stream_id,
+                    bucket="actor",
+                    name="voice_asr_hint",
+                    content=(
+                        "当前对话中包含语音消息，其内容由语音识别（ASR）自动转换，"
+                        "可能存在同音字、近形字或识别偏差。请根据上下文理解用户语音的真实内容，"
+                        "不要纠错字或指出识别错误，因为这些大概率是 ASR 识别错误而非用户问题，如果为空则是没识别出来，"
+                        "对于这种情况静默处理，不要主动提及。"
+                        "以及你在听语音时，不要说是系统识别之类的话，就当是自己真的听完了一样。"
+                    ),
+                    insert_type=SystemReminderInsertType.DYNAMIC,
+                    consume=SystemReminderConsumeType.ONCE,
+                )
+            except Exception as e:
+                logger.debug(f"注入语音提示词失败（忽略）: {e!s}")
 
         # 检查是否启用 SnowLuma 原生语音转文字
         sl_voice_enabled = True
@@ -344,31 +421,59 @@ class MessageHandler:
             sl_voice_enabled = config.features.enable_sl_voice_to_text
 
         # 优先：SnowLuma 原生 fetch_ptt_text
+        sl_voice_text: str | None = None
         if sl_voice_enabled and message_id:
             try:
-                text = await fetch_ptt_text(message_id)
-                if text:
-                    logger.debug(f"SL 语音转文字成功: {text[:50]}")
-                    return {"type": "text", "data": f"[语音:{text}]"}
-                logger.debug("SL 语音转文字返回空结果")
+                sl_voice_text = await fetch_ptt_text(message_id)
+                if sl_voice_text:
+                    logger.debug(f"SL 语音转文字成功: {sl_voice_text[:50]}")
+                else:
+                    logger.debug("SL 语音转文字返回空结果")
             except Exception as e:
                 logger.warning(f"SL 语音转文字失败: {e!s}")
 
-        # 次选：通过 get_record 下载 WAV，返回 voice 段交由框架 ASR
+        # 获取语音 base64 数据，返回 voice 段让框架注入 media_id
         if file or file_id:
             try:
                 record_data = await get_record_detail(file, file_id, adapter=self.adapter)
                 if record_data:
                     base64_data = record_data.get("base64") or record_data.get("data") or ""
                     if base64_data:
-                        logger.debug("通过 get_record 获取到语音 base64 数据，交由框架 ASR")
+                        # SL 转文字成功时，预先把识别结果写入 Voices 表和缓存表，避免框架重复 ASR
+                        if sl_voice_text:
+                            try:
+                                from src.app.plugin_system.api.media_api import save_media_info
+                                from src.core.managers.media_manager import get_media_manager
+
+                                manager = get_media_manager()
+                                voice_hash = manager.compute_media_hash(base64_data)
+                                # 写入 Voices 表（asr_processed=True）
+                                await save_media_info(
+                                    media_hash=voice_hash,
+                                    media_type="voice",
+                                    description=sl_voice_text,
+                                    vlm_processed=True,
+                                )
+                                # 写入 VoiceDescriptions 缓存表，让 recognize_media 缓存命中跳过 ASR
+                                await manager._save_voice_description_cache(voice_hash, sl_voice_text)
+                                logger.debug(f"SL 语音识别结果已写入缓存: {voice_hash[:8]}...")
+                            except Exception as e:
+                                logger.warning(f"写入语音缓存失败: {e!s}")
+
+                        logger.debug("通过 get_record 获取到语音 base64 数据，返回 voice 段")
+                        _inject_voice_hint()
                         return {"type": "voice", "data": base64_data}
                     logger.debug("get_record 返回数据中未找到 base64 字段")
             except Exception as e:
                 logger.warning(f"get_record 获取语音失败: {e!s}")
 
+        # 无法获取 base64 数据时，用 SL 转文字结果作为 text 段兜底
+        if sl_voice_text:
+            _inject_voice_hint()
+            return {"type": "text", "data": f"[语音:{sl_voice_text}]"}
+
         # 兜底：返回占位符，不丢弃语音段
-        return {"type": "text", "data": "[语音]"}
+        return {"type": "text", "data": "[语音(识别失败)]"}
 
     async def _handle_video_message(self, segment: dict) -> SegPayload | None:
         """处理视频消息"""

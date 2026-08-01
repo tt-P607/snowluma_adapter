@@ -19,6 +19,23 @@ if TYPE_CHECKING:
 
 logger = get_logger("snowluma_adapter")
 
+# 控制字符（除常见空格类字符外）移除表
+_INVALID_CHARS = str.maketrans({chr(i): None for i in range(0x20) if i not in (0x09, 0x0A, 0x0D)})
+
+
+def sanitize_text(text: str | None) -> str | None:
+    """移除字符串中可能导致 PostgreSQL UTF-8 存储失败的无效字符。
+
+    Args:
+        text: 待清理的原始字符串。
+
+    Returns:
+        清理后的字符串；输入为 None 时返回 None。
+    """
+    if text is None:
+        return None
+    return text.translate(_INVALID_CHARS)
+
 # 简单的缓存实现，通过 kernel.storage 实现磁盘持久化存储
 _CACHE_LOADED = False
 _CACHE: dict[str, dict[str, dict[str, Any]]] = {
@@ -387,7 +404,7 @@ async def get_message_detail(
 
 async def get_record_detail(
     file: str,
-    file_id: str | None = None,
+    file_id: str = "",
     *,
     out_format: str = "wav",
     adapter: "SnowLumaAdapter | None" = None,
@@ -435,11 +452,14 @@ async def fetch_ptt_text(
         adapter: 可选的适配器实例
 
     Returns:
-        识别出的文本，失败返回 None
+        识别出的文本
+
+    Raises:
+        RuntimeError: 服务端返回错误（如 retcode=100 语音识别失败）、
+            响应为空或数据格式异常时抛出，由调用方捕获后回退到 ASR。
     """
     if not message_id:
-        logger.warning("fetch_ptt_text 缺少 message_id")
-        return None
+        raise RuntimeError("fetch_ptt_text 缺少 message_id")
     logger.debug(f"获取语音转文字中: message_id={message_id}")
     response = await _call_adapter_api(
         "fetch_ptt_text",
@@ -448,25 +468,29 @@ async def fetch_ptt_text(
         timeout=30,
     )
     if not response:
-        logger.debug("fetch_ptt_text 响应为空")
-        return None
-    logger.debug(f"fetch_ptt_text 完整响应: {response!s}")
+        raise RuntimeError("fetch_ptt_text 响应为空")
     status = response.get("status", "")
     retcode = response.get("retcode", -1)
     if status != "ok" or retcode != 0:
-        logger.warning(f"fetch_ptt_text API 返回错误: status={status}, retcode={retcode}, wording={response.get('wording', '')}")
-        return None
+        # retcode=100 (ptt translate failed) 是服务端语音识别失败的正常场景
+        # （如语音太短/纯噪音），抛异常让调用方回退到 ASR
+        raise RuntimeError(
+            f"fetch_ptt_text API 返回错误: status={status}, retcode={retcode}, "
+            f"wording={response.get('wording', '')}"
+        )
     data = response.get("data")
     if isinstance(data, dict):
-        text = data.get("text") or data.get("result") or None
+        text = data.get("text") or data.get("result")
         if text:
             return text
-        logger.debug(f"fetch_ptt_text 响应中未找到 text 字段, data keys: {list(data.keys())}")
-        return None
+        raise RuntimeError(
+            f"fetch_ptt_text 响应中未找到 text 字段, data keys: {list(data.keys())}"
+        )
     if isinstance(data, str):
-        return data or None
-    logger.debug(f"fetch_ptt_text 响应 data 类型异常: {type(data)}")
-    return None
+        if data:
+            return data
+        raise RuntimeError("fetch_ptt_text 响应 data 为空字符串")
+    raise RuntimeError(f"fetch_ptt_text 响应 data 类型异常: {type(data)}")
 
 
 async def get_forward_message(

@@ -24,15 +24,18 @@ class SendHandler:
     def __init__(self, adapter: "SnowLumaAdapter"):
         self.adapter = adapter
 
-    async def handle_message(self, envelope: MessageEnvelope) -> None:
+    async def handle_message(self, envelope: MessageEnvelope) -> str | None:
         """
         处理来自核心的消息，将其转换为 SnowLuma 可接受的格式并发送
+
+        Returns:
+            str | None: 发送成功且平台返回了消息 ID 时返回该 ID，否则返回 None
         """
         logger.debug("接收到来自MoFox-Bot的消息，处理中")
 
         if not envelope:
             logger.warning("空的消息，跳过处理")
-            return
+            return None
 
         message_segment = envelope.get("message_segment")
         if isinstance(message_segment, list):
@@ -45,19 +48,24 @@ class SendHandler:
 
             if seg_type == "command":
                 logger.debug("处理命令")
-                return await self.send_command(envelope)
+                await self.send_command(envelope)
+                return None
             if seg_type == "adapter_command":
                 logger.debug("处理适配器命令")
-                return await self.handle_adapter_command(envelope)
+                await self.handle_adapter_command(envelope)
+                return None
             if seg_type == "adapter_response":
                 logger.debug("收到adapter_response消息，此消息应该由Bot端处理，跳过")
                 return None
 
         return await self.send_normal_message(envelope)
 
-    async def send_normal_message(self, envelope: MessageEnvelope) -> None:
+    async def send_normal_message(self, envelope: MessageEnvelope) -> str | None:
         """
         处理普通消息发送
+
+        Returns:
+            str | None: 发送成功且平台返回了消息 ID 时返回该 ID，否则返回 None
         """
         message_info: MessageInfoPayload = envelope.get("message_info", {})
         message_segment: SegPayload = envelope.get("message_segment", {})  # type: ignore[assignment]
@@ -74,7 +82,7 @@ class SendHandler:
         id_name: str | None = None
         processed_message: list = []
         try:
-            processed_message = await self.handle_seg_recursive(seg_data, user_info or {})  # type: ignore[arg-type]
+            processed_message = await self.handle_seg_recursive(seg_data, user_info or {}, group_info)  # type: ignore[arg-type]
         except Exception as e:
             logger.error(f"处理消息时发生错误: {e}")
             return None
@@ -100,7 +108,7 @@ class SendHandler:
             id_name = "user_id"
         else:
             logger.error("无法识别的消息类型")
-            return
+            return None
         logger.debug(
             f"准备发送到 snowluma 的消息体: action='{action}', {id_name}='{target_id}', "
             f"message={str(processed_message)[:500]}"
@@ -112,10 +120,19 @@ class SendHandler:
                 "message": processed_message,
             },
         )
-        if response.get("status") == "ok":
-            logger.info("消息发送成功")
-        else:
+        if response.get("status") != "ok":
             logger.warning(f"消息发送失败，snowluma返回：{response!s}")
+            return None
+
+        logger.info("消息发送成功")
+
+        # 提取平台返回的消息 ID，没有则返回 None
+        data = response.get("data")
+        if isinstance(data, dict):
+            message_id = data.get("message_id")
+            if message_id is not None:
+                return str(message_id)
+        return None
 
     async def send_command(self, envelope: MessageEnvelope) -> None:
         """
@@ -252,7 +269,7 @@ class SendHandler:
             return 1 + max(self.get_level(seg) for seg in seg_data.get("data", []) if isinstance(seg, dict))
         return 1
 
-    async def handle_seg_recursive(self, seg_data: SegPayload, user_info: UserInfoPayload) -> list:
+    async def handle_seg_recursive(self, seg_data: SegPayload, user_info: UserInfoPayload, group_info: GroupInfoPayload | None = None) -> list:
         payload: list = []
         if seg_data.get("type") == "seglist":
             if not seg_data.get("data"):
@@ -260,12 +277,12 @@ class SendHandler:
             for seg in seg_data["data"]:
                 if not isinstance(seg, dict):
                     continue
-                payload = await self.process_message_by_type(seg, payload, user_info)
+                payload = await self.process_message_by_type(seg, payload, user_info, group_info)
         else:
-            payload = await self.process_message_by_type(seg_data, payload, user_info)
+            payload = await self.process_message_by_type(seg_data, payload, user_info, group_info)
         return payload
 
-    async def process_message_by_type(self, seg: SegPayload, payload: list, user_info: UserInfoPayload) -> list:
+    async def process_message_by_type(self, seg: SegPayload, payload: list, user_info: UserInfoPayload, group_info: GroupInfoPayload | None = None) -> list:
         new_payload = payload
         seg_type = seg.get("type")
         if seg_type == "reply":
@@ -273,7 +290,7 @@ class SendHandler:
             target_id = str(target_id)
             if target_id == "notice":
                 return payload
-            new_payload = self.build_payload(payload, await self.handle_reply_message(target_id, user_info), True)
+            new_payload = self.build_payload(payload, await self.handle_reply_message(target_id, user_info, group_info), True)
         elif seg_type == "text":
             text = seg.get("data")
             if not text:
@@ -317,7 +334,7 @@ class SendHandler:
             for sub_seg in seg.get("data", []):
                 if not isinstance(sub_seg, dict):
                     continue
-                nested_payload = await self.process_message_by_type(sub_seg, nested_payload, user_info)
+                nested_payload = await self.process_message_by_type(sub_seg, nested_payload, user_info, group_info)
             new_payload = self.build_payload(payload, nested_payload, False)
         return new_payload
 
@@ -342,10 +359,18 @@ class SendHandler:
             payload.append(addon)
         return payload
 
-    async def handle_reply_message(self, message_id: str, user_info: UserInfoPayload) -> dict | list:
-        """处理回复消息"""
+    async def handle_reply_message(self, message_id: str, user_info: UserInfoPayload, group_info: GroupInfoPayload | None = None) -> dict | list:
+        """处理回复消息。
+
+        私聊场景下引用回复不执行 @（私聊中 @无意义），仅群聊时根据配置决定是否 @被引用消息的发送者。
+        """
         logger.debug(f"开始处理回复消息，消息ID: {message_id}")
         reply_seg = {"type": "reply", "data": {"id": message_id}}
+
+        # 私聊场景：引用回复不 @，直接返回纯 reply 段
+        if not group_info or not group_info.get("group_id"):
+            logger.debug("私聊场景，引用回复不执行 @")
+            return reply_seg
 
         # 检查是否启用引用艾特功能
         enable_reply_at = False

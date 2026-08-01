@@ -11,12 +11,13 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from mofox_wire import SegPayload, UserInfoPayload
+from mofox_wire.types import UserRole
 
 from src.app.plugin_system.api.log_api import get_logger
 from src.core.models.message import Message, MessageType
 
 from ...event_models import QQ_FACE, NoticeType, RealMessageType
-from ..utils import get_group_info, get_member_info, get_message_detail, get_self_info, get_stranger_info
+from ..utils import get_group_info, get_member_info, get_message_detail, get_self_info, get_stranger_info, sanitize_text
 
 if TYPE_CHECKING:
     from ....plugin import SnowLumaAdapter
@@ -109,8 +110,13 @@ class NoticeHandler:
                         return
 
                     case _:
-                        logger.warning(f"不支持的notify类型: {notice_type}.{sub_type}")
-                        return
+                        logger.warning(f"不支持的notify类型: {notice_type}.{sub_type}，将原始数据包装为消息后抛出")
+                        handled_segment, user_info = await self._handle_raw_passthrough(raw, notice_type)
+                        if handled_segment and user_info:
+                            notice_config["notice_type"] = str(notice_type)
+                            notice_config["raw"] = raw
+                        else:
+                            return
 
             case NoticeType.group_msg_emoji_like:
                 # 检查是否启用表情回复功能
@@ -167,8 +173,13 @@ class NoticeHandler:
                             return
 
                     case _:
-                        logger.warning(f"不支持的group_ban类型: {notice_type}.{sub_type}")
-                        return
+                        logger.warning(f"不支持的group_ban类型: {notice_type}.{sub_type}，将原始数据包装为消息后抛出")
+                        handled_segment, user_info = await self._handle_raw_passthrough(raw, notice_type)
+                        if handled_segment and user_info:
+                            notice_config["notice_type"] = str(notice_type)
+                            notice_config["raw"] = raw
+                        else:
+                            return
 
             case NoticeType.group_upload:
                 logger.info("[#FAB387]群文件上传[/#FAB387]")
@@ -184,9 +195,58 @@ class NoticeHandler:
                 else:
                     return
 
+            case NoticeType.group_increase:
+                logger.info("[#FAB387]群成员入群[/#FAB387]")
+                handled_segment, user_info = await self._handle_group_increase_notify(
+                    raw, group_id, user_id
+                )
+                if handled_segment and user_info:
+                    notice_config["notice_type"] = "group_increase"
+                    notice_config["is_notice"] = True
+                else:
+                    return
+
+            case NoticeType.group_decrease:
+                logger.info("[#FAB387]群成员退群[/#FAB387]")
+                handled_segment, user_info = await self._handle_group_decrease_notify(
+                    raw, group_id, user_id
+                )
+                if handled_segment and user_info:
+                    notice_config["notice_type"] = "group_decrease"
+                    notice_config["is_notice"] = True
+                else:
+                    return
+
+            case NoticeType.group_admin:
+                logger.info("[#FAB387]群管理员变动[/#FAB387]")
+                handled_segment, user_info = await self._handle_group_admin_notify(
+                    raw, group_id, user_id
+                )
+                if handled_segment and user_info:
+                    notice_config["notice_type"] = "group_admin"
+                    notice_config["is_notice"] = True
+                else:
+                    return
+
+            case NoticeType.essence:
+                logger.info("[#FAB387]精华消息变动[/#FAB387]")
+                handled_segment, user_info = await self._handle_essence_notify(
+                    raw, group_id, user_id
+                )
+                if handled_segment and user_info:
+                    notice_config["notice_type"] = "essence"
+                    notice_config["is_notice"] = True
+                else:
+                    return
+
             case _:
-                logger.warning(f"不支持的notice类型: {notice_type}")
-                return
+                logger.warning(f"不支持的notice类型: {notice_type}，将原始数据包装为消息后抛出")
+                handled_segment, user_info = await self._handle_raw_passthrough(raw, notice_type)
+                if handled_segment and user_info:
+                    notice_config["notice_type"] = str(notice_type)
+                    notice_config["raw"] = raw
+                else:
+                    return
 
         if not handled_segment or not user_info:
             logger.warning("notice处理失败或不支持")
@@ -261,6 +321,10 @@ class NoticeHandler:
             "group_lift_ban": "解除禁言",
             "group_whole_lift_ban": "解除全体禁言",
             "group_upload": "文件上传",
+            "group_increase": "入群",
+            "group_decrease": "退群",
+            "group_admin": "管理员变动",
+            "essence": "精华消息",
         }
         _notice_type_str = str(notice_config.get("notice_type", "notice"))
         _type_label = _NOTICE_TYPE_LABELS.get(_notice_type_str, _notice_type_str)
@@ -284,6 +348,7 @@ class NoticeHandler:
                 "notice_type": notice_config.get("notice_type", "unknown"),
                 "group_id": str(group_id) if group_id else "",
                 "group_name": group_name or "",
+                **({"raw": notice_config["raw"]} if "raw" in notice_config else {}),
             },
         )
 
@@ -310,6 +375,53 @@ class NoticeHandler:
 
         chat_stream.context.add_unread_message(message)
         chat_stream.update_active_time()
+
+    async def _handle_raw_passthrough(
+        self, raw: dict[str, Any], notice_type: Any
+    ) -> tuple[SegPayload | None, UserInfoPayload | None]:
+        """将不支持的 notice 原始数据转换为消息段与用户信息。
+
+        对于暂未实现具体转换逻辑的 notice 类型，不丢弃数据，而是构造一个
+        text 消息段承载可读描述，并返回最小化的用户信息。原始 raw 数据由
+        调用方写入 ``notice_config["raw"]``，最终携带在 ``Message.raw_data``
+        中供下游自行解析。
+
+        Args:
+            raw: SnowLuma 原始通知数据。
+            notice_type: notice 类型字符串。
+
+        Returns:
+            包含可读描述的 text 消息段与最小化用户信息；处理失败返回 None。
+        """
+        user_id = raw.get("user_id") or raw.get("self_id") or ""
+        group_id = raw.get("group_id")
+
+        user_nickname = ""
+        user_cardname = ""
+        if group_id and user_id:
+            user_qq_info: dict | None = await get_member_info(int(group_id), int(user_id))
+        else:
+            user_qq_info = await get_stranger_info(user_id) if user_id else None
+
+        if user_qq_info:
+            user_nickname = user_qq_info.get("nickname", "")
+            user_cardname = sanitize_text(user_qq_info.get("card", "")) or ""
+        else:
+            logger.debug("无法获取未支持notice类型的用户昵称")
+
+        user_info: UserInfoPayload = {
+            "platform": "qq",
+            "role": UserRole.MEMBER,  # type: ignore[typeddict-item]
+            "user_id": str(user_id),
+            "user_nickname": user_nickname,
+            "user_cardname": user_cardname,
+        }
+
+        seg_data: SegPayload = {
+            "type": "text",
+            "data": f"[未支持的notice类型: {notice_type}]",
+        }
+        return seg_data, user_info
 
     async def _handle_recall(
         self, raw: dict[str, Any], *, is_group: bool, message_time: float
@@ -443,7 +555,7 @@ class NoticeHandler:
 
         if user_qq_info:
             user_name = user_qq_info.get("nickname", "QQ用户")
-            user_cardname = user_qq_info.get("card", "")
+            user_cardname = sanitize_text(user_qq_info.get("card", ""))
         else:
             user_name = "QQ用户"
             user_cardname = ""
@@ -513,7 +625,7 @@ class NoticeHandler:
         user_qq_info: dict | None = await get_member_info(int(group_id) if group_id else 0, int(user_id) if user_id else 0)
         if user_qq_info:
             user_name = user_qq_info.get("nickname", "QQ用户")
-            user_cardname = user_qq_info.get("card", "")
+            user_cardname = sanitize_text(user_qq_info.get("card", ""))
         else:
             user_name = "QQ用户"
             user_cardname = ""
@@ -524,12 +636,42 @@ class NoticeHandler:
 
         from ...event_types import SnowLumaEvent
 
-        target_message = await get_message_detail(raw.get("message_id", ""))
-        if not target_message:
+        target_message_id = raw.get("message_id", "")
+        target_message_text = await self._get_message_preview(target_message_id)
+
+        # 查数据库获取被回应消息的发送者
+        target_sender_name = ""
+        if target_message_id:
+            try:
+                from src.core.models.sql_alchemy import Messages, PersonInfo
+                from src.kernel.db import QueryBuilder
+                from typing import cast
+
+                msg_record = cast(Messages | None, await (
+                    QueryBuilder(Messages)
+                    .filter(message_id=str(target_message_id))
+                    .first()
+                ))
+                if msg_record:
+                    person_id = msg_record.person_id
+                    if person_id == "bot":
+                        target_sender_name = "Bot"
+                    elif person_id:
+                        person_record = cast(PersonInfo | None, await (
+                            QueryBuilder(PersonInfo)
+                            .filter(person_id=person_id)
+                            .first()
+                        ))
+                        if person_record:
+                            nickname = person_record.nickname or ""
+                            cardname = person_record.cardname or ""
+                            target_sender_name = cardname or nickname or ""
+            except Exception as e:
+                logger.debug(f"查询被回应消息发送者失败: {e!s}")
+
+        if not target_message_text:
             logger.error("未找到对应消息")
             return None, None
-
-        target_message_text = await self._extract_message_preview(target_message)
 
         user_info: UserInfoPayload = {
             "platform": "qq",
@@ -558,9 +700,54 @@ class NoticeHandler:
         emoji_text = QQ_FACE.get(like_emoji_id, f"[表情{like_emoji_id}]")
         seg_data: SegPayload = {
             "type": "text",
-            "data": f"{user_name}使用Emoji表情{emoji_text}回应了消息[{target_message_text}]",
+            "data": (
+                f"{user_name}使用Emoji表情{emoji_text}回应了{target_sender_name}的消息[{target_message_text}]"
+                if target_sender_name
+                else f"{user_name}使用Emoji表情{emoji_text}回应了消息[{target_message_text}]"
+            ),
         }
         return seg_data, user_info
+
+    async def _get_message_preview(self, message_id: str) -> str | None:
+        """获取消息预览文本，优先从数据库查询已识别的 processed_plain_text。
+
+        数据库中的 processed_plain_text 包含 VLM/ASR 识别结果和 media_id，
+        比直接解析原始消息段更准确。查不到时 fallback 到 get_message_detail。
+
+        Args:
+            message_id: 消息 ID
+
+        Returns:
+            消息预览文本；查询失败返回 None
+        """
+        if not message_id:
+            return None
+
+        # 优先查数据库
+        try:
+            from src.core.models.sql_alchemy import Messages
+            from src.kernel.db import QueryBuilder
+            from typing import cast
+
+            msg_record = cast(Messages | None, await (
+                QueryBuilder(Messages)
+                .filter(message_id=message_id)
+                .first()
+            ))
+            if msg_record and msg_record.processed_plain_text:
+                return msg_record.processed_plain_text
+        except Exception as e:
+            logger.debug(f"查询消息预览失败: {e!s}")
+
+        # fallback: 通过 get_message_detail 获取原始消息并解析
+        try:
+            msg_detail = await get_message_detail(message_id)
+            if msg_detail:
+                return await self._extract_message_preview(msg_detail)
+        except Exception as e:
+            logger.debug(f"获取消息详情失败: {e!s}")
+
+        return None
 
     async def _extract_message_preview(self, message_detail: dict[str, Any], depth: int = 0) -> str:
         """提取被表情回应消息的可读摘要，支持多层嵌套"""
@@ -615,7 +802,7 @@ class NoticeHandler:
         user_qq_info: dict | None = await get_member_info(int(group_id) if group_id else 0, int(user_id) if user_id else 0)
         if user_qq_info:
             user_name = user_qq_info.get("nickname", "QQ用户")
-            user_cardname = user_qq_info.get("card", "")
+            user_cardname = sanitize_text(user_qq_info.get("card", ""))
         else:
             user_name = "QQ用户"
             user_cardname = ""
@@ -659,7 +846,7 @@ class NoticeHandler:
         member_info: dict | None = await get_member_info(int(group_id) if group_id else 0, int(operator_id) if operator_id else 0)
         if member_info:
             operator_nickname = member_info.get("nickname", "QQ用户")
-            operator_cardname = member_info.get("card", "")
+            operator_cardname = sanitize_text(member_info.get("card", "")) or ""
         else:
             logger.warning("无法获取禁言执行者的昵称，消息可能会无效")
 
@@ -690,7 +877,7 @@ class NoticeHandler:
             fetched_member_info: dict | None = await get_member_info(int(group_id) if group_id else 0, int(user_id) if user_id else 0)
             if fetched_member_info:
                 user_nickname = fetched_member_info.get("nickname", "QQ用户")
-                user_cardname = fetched_member_info.get("card", "")
+                user_cardname = sanitize_text(fetched_member_info.get("card", "")) or ""
             banned_user_info = {
                 "platform": "qq",
                 "user_id": str(user_id),
@@ -725,7 +912,7 @@ class NoticeHandler:
         member_info: dict | None = await get_member_info(int(group_id) if group_id else 0, int(operator_id) if operator_id else 0)
         if member_info:
             operator_nickname = member_info.get("nickname", "QQ用户")
-            operator_cardname = member_info.get("card", "")
+            operator_cardname = sanitize_text(member_info.get("card", "")) or ""
         else:
             logger.warning("无法获取解除禁言执行者的昵称，消息可能会无效")
 
@@ -751,7 +938,7 @@ class NoticeHandler:
             fetched_member_info: dict | None = await get_member_info(int(group_id) if group_id else 0, int(user_id) if user_id else 0)
             if fetched_member_info:
                 user_nickname = fetched_member_info.get("nickname", "QQ用户")
-                user_cardname = fetched_member_info.get("card", "")
+                user_cardname = sanitize_text(fetched_member_info.get("card", "")) or ""
             else:
                 logger.warning("无法获取解除禁言消息发送者的昵称，消息可能会无效")
             lifted_user_info = {
@@ -770,3 +957,265 @@ class NoticeHandler:
             }
         }
         return seg_data, operator_info
+
+    async def _handle_group_increase_notify(
+        self, raw: dict[str, Any], group_id: Any, user_id: Any
+    ) -> tuple[SegPayload | None, UserInfoPayload | None]:
+        """处理群成员入群通知。
+
+        OneBot v11 ``group_increase`` 事件字段：
+        - ``sub_type``: ``approve``（审批通过）/ ``invite``（被邀请）
+        - ``operator_id``: 操作者（审批人/邀请人）
+        - ``user_id``: 入群者
+
+        Args:
+            raw: 原始通知数据
+            group_id: 群 ID
+            user_id: 入群者 user_id
+
+        Returns:
+            text 消息段与入群者用户信息；处理失败返回 None。
+        """
+        if not group_id:
+            logger.warning("群ID为空，无法处理入群通知")
+            return None, None
+
+        sub_type = raw.get("sub_type", "approve")
+        operator_id = raw.get("operator_id") or user_id
+
+        # 获取入群者信息
+        user_nickname: str = "QQ用户"
+        user_cardname: str = ""
+        member_info: dict | None = await get_member_info(
+            int(group_id) if group_id else 0, int(user_id) if user_id else 0
+        )
+        if member_info:
+            user_nickname = member_info.get("nickname", "QQ用户")
+            user_cardname = sanitize_text(member_info.get("card", "")) or ""
+        else:
+            logger.debug("无法获取入群者的群成员信息")
+
+        # 获取操作者信息（用于显示是谁批准/邀请的）
+        operator_name: str = "QQ用户"
+        if operator_id and str(operator_id) != str(user_id):
+            op_info: dict | None = await get_member_info(
+                int(group_id) if group_id else 0, int(operator_id) if operator_id else 0
+            )
+            if op_info:
+                operator_name = op_info.get("card") or op_info.get("nickname", "QQ用户")
+        else:
+            operator_name = user_nickname
+
+        user_info: UserInfoPayload = {
+            "platform": "qq",
+            "user_id": str(user_id),
+            "user_nickname": user_nickname,
+            "user_cardname": user_cardname,
+            "role": "",  # type: ignore[typeddict-item]
+        }
+
+        action_text = "被邀请" if sub_type == "invite" else "通过审批"
+        seg_data: SegPayload = {
+            "type": "text",
+            "data": f"{user_nickname}加入了本群（{action_text}，审批人：{operator_name}）",
+        }
+        return seg_data, user_info
+
+    async def _handle_group_decrease_notify(
+        self, raw: dict[str, Any], group_id: Any, user_id: Any
+    ) -> tuple[SegPayload | None, UserInfoPayload | None]:
+        """处理群成员退群通知。
+
+        OneBot v11 ``group_decrease`` 事件字段：
+        - ``sub_type``: ``leave``（主动退群）/ ``kick``（被踢）/ ``kick_me``（Bot被踢）
+        - ``operator_id``: 操作者（踢人者）
+        - ``user_id``: 退群者
+
+        Args:
+            raw: 原始通知数据
+            group_id: 群 ID
+            user_id: 退群者 user_id
+
+        Returns:
+            text 消息段与退群者用户信息；处理失败返回 None。
+        """
+        if not group_id:
+            logger.warning("群ID为空，无法处理退群通知")
+            return None, None
+
+        sub_type = raw.get("sub_type", "leave")
+        operator_id = raw.get("operator_id") or user_id
+
+        # 获取退群者信息（退群后可能查不到群成员信息）
+        user_nickname: str = "QQ用户"
+        member_info: dict | None = await get_member_info(
+            int(group_id) if group_id else 0, int(user_id) if user_id else 0
+        )
+        if member_info:
+            user_nickname = member_info.get("card") or member_info.get("nickname", "QQ用户")
+        else:
+            # 退群后查不到群成员信息，尝试获取陌生人信息
+            stranger_info: dict | None = await get_stranger_info(user_id)
+            if stranger_info:
+                user_nickname = stranger_info.get("nickname", "QQ用户")
+            logger.debug("退群者已不在群中，使用陌生人信息")
+
+        # 获取操作者信息
+        operator_name: str = "QQ用户"
+        if sub_type in ("kick", "kick_me") and operator_id:
+            op_info: dict | None = await get_member_info(
+                int(group_id) if group_id else 0, int(operator_id) if operator_id else 0
+            )
+            if op_info:
+                operator_name = op_info.get("card") or op_info.get("nickname", "QQ用户")
+        else:
+            operator_name = user_nickname
+
+        user_info: UserInfoPayload = {
+            "platform": "qq",
+            "user_id": str(user_id),
+            "user_nickname": user_nickname,
+            "user_cardname": "",
+            "role": "",  # type: ignore[typeddict-item]
+        }
+
+        if sub_type == "leave":
+            action_text = f"{user_nickname}主动退出了本群"
+        elif sub_type == "kick":
+            action_text = f"{user_nickname}被{operator_name}踢出了本群"
+        elif sub_type == "kick_me":
+            action_text = f"Bot被{operator_name}踢出了群"
+        else:
+            action_text = f"{user_nickname}离开了本群"
+
+        seg_data: SegPayload = {
+            "type": "text",
+            "data": action_text,
+        }
+        return seg_data, user_info
+
+    async def _handle_group_admin_notify(
+        self, raw: dict[str, Any], group_id: Any, user_id: Any
+    ) -> tuple[SegPayload | None, UserInfoPayload | None]:
+        """处理群管理员变动通知。
+
+        OneBot v11 ``group_admin`` 事件字段：
+        - ``sub_type``: ``set``（设置管理员）/ ``unset``（取消管理员）
+        - ``user_id``: 被操作者
+
+        Args:
+            raw: 原始通知数据
+            group_id: 群 ID
+            user_id: 被操作者 user_id
+
+        Returns:
+            text 消息段与被操作者用户信息；处理失败返回 None。
+        """
+        if not group_id:
+            logger.warning("群ID为空，无法处理管理员变动通知")
+            return None, None
+
+        sub_type = raw.get("sub_type", "set")
+
+        # 获取被操作者信息
+        user_nickname: str = "QQ用户"
+        user_cardname: str = ""
+        member_info: dict | None = await get_member_info(
+            int(group_id) if group_id else 0, int(user_id) if user_id else 0
+        )
+        if member_info:
+            user_nickname = member_info.get("nickname", "QQ用户")
+            user_cardname = sanitize_text(member_info.get("card", "")) or ""
+        else:
+            logger.debug("无法获取被操作者的群成员信息")
+
+        user_info: UserInfoPayload = {
+            "platform": "qq",
+            "user_id": str(user_id),
+            "user_nickname": user_nickname,
+            "user_cardname": user_cardname,
+            "role": "",  # type: ignore[typeddict-item]
+        }
+
+        action_text = "被任命为管理员" if sub_type == "set" else "被取消了管理员"
+        seg_data: SegPayload = {
+            "type": "text",
+            "data": f"{user_nickname}{action_text}",
+        }
+        return seg_data, user_info
+
+    async def _handle_essence_notify(
+        self, raw: dict[str, Any], group_id: Any, user_id: Any
+    ) -> tuple[SegPayload | None, UserInfoPayload | None]:
+        """处理精华消息变动通知。
+
+        OneBot v11 ``essence`` 事件字段：
+        - ``sub_type``: ``add``（设置精华）/ ``delete``（移除精华）
+        - ``message_id``: 被操作的 message_id
+        - ``operator_id``: 操作者
+        - ``user_id``: 被操作消息的发送者
+
+        Args:
+            raw: 原始通知数据
+            group_id: 群 ID
+            user_id: 被操作消息的发送者 user_id
+
+        Returns:
+            text 消息段与操作者用户信息；处理失败返回 None。
+        """
+        if not group_id:
+            logger.warning("群ID为空，无法处理精华消息通知")
+            return None, None
+
+        sub_type = raw.get("sub_type", "add")
+        message_id = str(raw.get("message_id", ""))
+        operator_id = raw.get("operator_id") or user_id
+
+        # 获取操作者信息
+        operator_nickname: str = "QQ用户"
+        operator_cardname: str = ""
+        op_info: dict | None = await get_member_info(
+            int(group_id) if group_id else 0, int(operator_id) if operator_id else 0
+        )
+        if op_info:
+            operator_nickname = op_info.get("nickname", "QQ用户")
+            operator_cardname = sanitize_text(op_info.get("card", "")) or ""
+        else:
+            logger.debug("无法获取精华消息操作者的群成员信息")
+
+        # 获取被操作消息发送者信息
+        sender_nickname: str = "QQ用户"
+        member_info: dict | None = await get_member_info(
+            int(group_id) if group_id else 0, int(user_id) if user_id else 0
+        )
+        if member_info:
+            sender_nickname = member_info.get("card") or member_info.get("nickname", "QQ用户")
+
+        user_info: UserInfoPayload = {
+            "platform": "qq",
+            "user_id": str(operator_id),
+            "user_nickname": operator_nickname,
+            "user_cardname": operator_cardname,
+            "role": "",  # type: ignore[typeddict-item]
+        }
+
+        # 尝试获取被操作消息的内容预览
+        msg_preview = ""
+        if message_id:
+            try:
+                preview = await self._get_message_preview(message_id)
+                if preview:
+                    msg_preview = preview
+            except Exception as e:
+                logger.debug(f"获取精华消息内容失败: {e!s}")
+
+        action_text = "设置了精华消息" if sub_type == "add" else "移除了精华消息"
+        if msg_preview:
+            content = f"{operator_nickname}{action_text}（{sender_nickname}的消息：{msg_preview}）"
+        else:
+            content = f"{operator_nickname}{action_text}（消息发送者：{sender_nickname}）"
+        seg_data: SegPayload = {
+            "type": "text",
+            "data": content,
+        }
+        return seg_data, user_info

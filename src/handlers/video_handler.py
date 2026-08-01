@@ -63,6 +63,55 @@ class VideoDownloader:
         except Exception:
             return True
 
+    async def _probe_file_size(self, session: aiohttp.ClientSession, url: str) -> int | None:
+        """用 Range 请求探测文件总大小。
+
+        QQ 多媒体服务器不支持 HEAD 方法（返回 400），改用
+        ``Range: bytes=0-0`` 的 GET 请求探测文件总大小：
+        - 206 响应从 Content-Range 解析总字节数
+        - 200 分支已注释（QQ 服务器实测返回 206，200 不会命中）
+        - 探测失败时返回 None，由调用方决定是否继续完整下载
+
+        Args:
+            session: aiohttp 会话
+            url: 视频 URL
+
+        Returns:
+            文件总字节数；探测失败返回 None
+        """
+        try:
+            async with session.get(
+                url,
+                headers={"Range": "bytes=0-0"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as response:
+                # 206：服务器支持 Range，从 Content-Range 解析总大小
+                if response.status == 206:
+                    content_range = response.headers.get("Content-Range", "")
+                    # Content-Range 格式: bytes 0-0/123456
+                    if "/" in content_range:
+                        total_str = content_range.rsplit("/", 1)[-1]
+                        try:
+                            return int(total_str)
+                        except ValueError:
+                            return None
+                    return None
+                # 200：服务器不支持 Range，Content-Length 即文件总大小
+                # (QQ 多媒体服务器在 2026-07-04 实测返回 206，200 分支不会命中，
+                # 注释掉以避免无意义分支；若 QQ 服务器后续变更可恢复)
+                # if response.status == 200:
+                #     content_length = response.headers.get("Content-Length")
+                #     if content_length is not None:
+                #         try:
+                #             return int(content_length)
+                #         except ValueError:
+                #             return None
+                # 其他状态码留给后续正式下载环节处理
+                return None
+        except Exception as e:
+            logger.debug(f"Range 探测文件大小失败: {e}")
+            return None
+
     async def download_video(self, url: str, filename: str | None = None) -> dict[str, Any]:
         """
         下载视频文件
@@ -83,21 +132,16 @@ class VideoDownloader:
                 return {"success": False, "error": "不支持的视频格式", "url": url}
 
             async with aiohttp.ClientSession() as session:
-                # 先发送HEAD请求检查文件大小
-                try:
-                    async with session.head(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                        if response.status != 200:
-                            logger.warning(f"HEAD请求失败，状态码: {response.status}")
-                        else:
-                            content_length = response.headers.get("Content-Length")
-                            if not self.check_file_size(content_length):
-                                return {
-                                    "success": False,
-                                    "error": f"视频文件过大，超过{self.max_size_mb}MB限制",
-                                    "url": url,
-                                }
-                except Exception as e:
-                    logger.warning(f"HEAD请求失败: {e}，继续尝试下载")
+                # 先用 Range 请求探测文件大小（QQ 多媒体服务器不支持 HEAD，会返回 400）
+                probed_size = await self._probe_file_size(session, url)
+                if probed_size is not None:
+                    logger.debug(f"探测到文件大小: {probed_size} 字节")
+                    if not self.check_file_size(str(probed_size)):
+                        return {
+                            "success": False,
+                            "error": f"视频文件过大，超过{self.max_size_mb}MB限制",
+                            "url": url,
+                        }
 
                 # 下载文件
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=self.download_timeout)) as response:
