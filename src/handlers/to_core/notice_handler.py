@@ -561,7 +561,7 @@ class NoticeHandler:
             user_cardname = ""
             logger.debug("无法获取戳一戳对方的用户昵称")
 
-        # 计算显示名称
+        # 计算显示名称：群聊优先使用群名片（card），无名片时用昵称，并附带 QQ 号
         display_name = ""
         if self_id == target_id:
             target_name = self_info.get("nickname", "")
@@ -581,11 +581,16 @@ class NoticeHandler:
             if group_id:
                 fetched_member_info: dict | None = await get_member_info(int(group_id) if group_id else 0, int(target_id) if target_id else 0)
                 if fetched_member_info:
-                    target_name = fetched_member_info.get("nickname", "QQ用户")
+                    target_card = sanitize_text(fetched_member_info.get("card", ""))
+                    target_name = target_card or fetched_member_info.get("nickname", "QQ用户")
                 else:
                     target_name = "QQ用户"
                     logger.debug("无法获取被戳一戳方的用户昵称")
-                display_name = user_name
+                # 发送者优先群名片，无名片用昵称，并附带 QQ 号便于识别
+                sender_display = user_cardname or user_name
+                display_name = f"{sender_display}({user_id})" if user_id else sender_display
+                if target_id:
+                    target_name = f"{target_name}({target_id})"
             else:
                 return None, None
 
@@ -639,7 +644,7 @@ class NoticeHandler:
         target_message_id = raw.get("message_id", "")
         target_message_text = await self._get_message_preview(target_message_id)
 
-        # 查数据库获取被回应消息的发送者
+        # 查数据库获取被回应消息的发送者（优先群名片，并附带 person_id 便于识别）
         target_sender_name = ""
         if target_message_id:
             try:
@@ -665,13 +670,18 @@ class NoticeHandler:
                         if person_record:
                             nickname = person_record.nickname or ""
                             cardname = person_record.cardname or ""
-                            target_sender_name = cardname or nickname or ""
+                            display = cardname or nickname or ""
+                            target_sender_name = f"{display}({person_id})" if display else ""
             except Exception as e:
                 logger.debug(f"查询被回应消息发送者失败: {e!s}")
 
         if not target_message_text:
             logger.error("未找到对应消息")
             return None, None
+
+        # 发送者优先群名片，无名片用昵称，并附带 QQ 号便于识别
+        sender_display = user_cardname or user_name
+        sender_with_id = f"{sender_display}({user_id})" if user_id else sender_display
 
         user_info: UserInfoPayload = {
             "platform": "qq",
@@ -701,9 +711,9 @@ class NoticeHandler:
         seg_data: SegPayload = {
             "type": "text",
             "data": (
-                f"{user_name}使用Emoji表情{emoji_text}回应了{target_sender_name}的消息[{target_message_text}]"
+                f"{sender_with_id}使用Emoji表情{emoji_text}回应了{target_sender_name}的消息[{target_message_text}]"
                 if target_sender_name
-                else f"{user_name}使用Emoji表情{emoji_text}回应了消息[{target_message_text}]"
+                else f"{sender_with_id}使用Emoji表情{emoji_text}回应了消息[{target_message_text}]"
             ),
         }
         return seg_data, user_info
