@@ -558,7 +558,8 @@ class MessageHandler:
                                     vlm_processed=True,
                                 )
                                 # 写入 VoiceDescriptions 缓存表，让 recognize_media 缓存命中跳过 ASR
-                                await manager._save_voice_description_cache(voice_hash, sl_voice_text)
+                                # 直接访问 MediaManager 内部缓存组件（自用插件，不额外扩展框架 API）
+                                await manager._cache.save_voice_description_cache(voice_hash, sl_voice_text)
                                 logger.debug(f"SL 语音识别结果已写入缓存: {voice_hash[:8]}...")
                             except Exception as e:
                                 logger.warning(f"写入语音缓存失败: {e!s}")
