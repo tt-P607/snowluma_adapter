@@ -17,7 +17,15 @@ from src.app.plugin_system.api.log_api import get_logger
 from src.core.models.message import Message, MessageType
 
 from ...event_models import QQ_FACE, NoticeType, RealMessageType
-from ..utils import get_group_info, get_member_info, get_message_detail, get_self_info, get_stranger_info, sanitize_text
+from ..utils import (
+    get_group_info,
+    get_image_base64,
+    get_member_info,
+    get_message_detail,
+    get_self_info,
+    get_stranger_info,
+    sanitize_text,
+)
 
 if TYPE_CHECKING:
     from ....plugin import SnowLumaAdapter
@@ -644,36 +652,59 @@ class NoticeHandler:
         target_message_id = raw.get("message_id", "")
         target_message_text = await self._get_message_preview(target_message_id)
 
-        # 查数据库获取被回应消息的发送者（优先群名片，并附带 person_id 便于识别）
+        # 获取被回应消息的发送者。优先从服务端原始消息段解析 sender
+        # （真实 user_id + 昵称），数据库 PersonInfo 仅作回退，避免 person_id
+        # 非标准哈希时错位显示（如把媒体哈希或错误的 QQ 号拼到昵称后）。
         target_sender_name = ""
         if target_message_id:
             try:
-                from src.core.models.sql_alchemy import Messages, PersonInfo
-                from src.kernel.db import QueryBuilder
-                from typing import cast
-
-                msg_record = cast(Messages | None, await (
-                    QueryBuilder(Messages)
-                    .filter(message_id=str(target_message_id))
-                    .first()
-                ))
-                if msg_record:
-                    person_id = msg_record.person_id
-                    if person_id == "bot":
-                        target_sender_name = "Bot"
-                    elif person_id:
-                        person_record = cast(PersonInfo | None, await (
-                            QueryBuilder(PersonInfo)
-                            .filter(person_id=person_id)
-                            .first()
-                        ))
-                        if person_record:
-                            nickname = person_record.nickname or ""
-                            cardname = person_record.cardname or ""
-                            display = cardname or nickname or ""
-                            target_sender_name = f"{display}({person_id})" if display else ""
+                detail = await get_message_detail(target_message_id)
+                detail_sender = (detail or {}).get("sender", {}) if detail else {}
+                detail_user_id = str(detail_sender.get("user_id") or "")
+                detail_nickname = str(
+                    detail_sender.get("card") or detail_sender.get("nickname") or ""
+                ).strip().replace("\n", " ").replace("\r", " ")
+                if detail_user_id or detail_nickname:
+                    target_sender_name = (
+                        f"{detail_nickname}({detail_user_id})"
+                        if detail_nickname and detail_user_id
+                        else (detail_nickname or detail_user_id)
+                    )
             except Exception as e:
-                logger.debug(f"查询被回应消息发送者失败: {e!s}")
+                logger.debug(f"获取被回应消息发送者失败: {e!s}")
+
+            # 服务端未提供 sender 时，回退到数据库 PersonInfo
+            if not target_sender_name:
+                try:
+                    from src.core.models.sql_alchemy import Messages, PersonInfo
+                    from src.kernel.db import QueryBuilder
+                    from typing import cast
+
+                    msg_record = cast(Messages | None, await (
+                        QueryBuilder(Messages)
+                        .filter(message_id=str(target_message_id))
+                        .first()
+                    ))
+                    if msg_record:
+                        person_id = msg_record.person_id
+                        if person_id == "bot":
+                            target_sender_name = "Bot"
+                        elif person_id:
+                            person_record = cast(PersonInfo | None, await (
+                                QueryBuilder(PersonInfo)
+                                .filter(person_id=person_id)
+                                .first()
+                            ))
+                            if person_record:
+                                nickname = (person_record.nickname or "").replace("\n", " ").replace("\r", " ")
+                                cardname = (person_record.cardname or "").replace("\n", " ").replace("\r", " ")
+                                display = cardname or nickname or ""
+                                user_id = person_record.user_id or ""
+                                target_sender_name = (
+                                    f"{display}({user_id})" if display and user_id else display
+                                )
+                except Exception as e:
+                    logger.debug(f"查询被回应消息记录失败: {e!s}")
 
         if not target_message_text:
             logger.error("未找到对应消息")
@@ -719,10 +750,12 @@ class NoticeHandler:
         return seg_data, user_info
 
     async def _get_message_preview(self, message_id: str) -> str | None:
-        """获取消息预览文本，优先从数据库查询已识别的 processed_plain_text。
+        """获取消息预览文本。
 
-        数据库中的 processed_plain_text 包含 VLM/ASR 识别结果和 media_id，
-        比直接解析原始消息段更准确。查不到时 fallback 到 get_message_detail。
+        优先取数据库 ``processed_plain_text``——Bot 发送的媒体消息入库时
+        已含 VLM/ASR 识别结果（如 ``[表情包:描述]``），比从服务端重取更
+        可靠且省一次 API 调用。数据库仅含占位符（如 ``[图片]``）时，再
+        从服务端 ``get_message_detail`` 取原始段并回查媒体描述。
 
         Args:
             message_id: 消息 ID
@@ -733,7 +766,7 @@ class NoticeHandler:
         if not message_id:
             return None
 
-        # 优先查数据库
+        db_preview: str | None = None
         try:
             from src.core.models.sql_alchemy import Messages
             from src.kernel.db import QueryBuilder
@@ -745,19 +778,41 @@ class NoticeHandler:
                 .first()
             ))
             if msg_record and msg_record.processed_plain_text:
-                return msg_record.processed_plain_text
+                db_preview = msg_record.processed_plain_text
         except Exception as e:
             logger.debug(f"查询消息预览失败: {e!s}")
 
-        # fallback: 通过 get_message_detail 获取原始消息并解析
+        # DB 预览是纯占位符或 [picid:uuid] 形式时，尝试回查媒体描述
+        if db_preview and db_preview not in ("[图片]", "[表情包]"):
+            # 仅当预览是 [picid:uuid] 这类纯 ID 占位符时才回查描述，
+            # 避免误伤普通文本（如含冒号的时间戳）
+            if db_preview.startswith("[picid:") and db_preview.endswith("]"):
+                try:
+                    import re
+
+                    uuid_match = re.search(r"picid:([0-9a-fA-F-]{36})", db_preview)
+                    if uuid_match:
+                        from src.app.plugin_system.api import media_api
+
+                        info = await media_api.get_media_info(uuid_match.group(1))
+                        description = (info or {}).get("description") if info else None
+                        if isinstance(description, str) and description.strip():
+                            return f"[图片:{self._truncate_preview(description.strip())}]"
+                except Exception as e:
+                    logger.debug(f"从 picid 回查媒体描述失败: {e!s}")
+            return self._truncate_preview(db_preview)
+
+        # DB 缺描述时，从服务端取原始消息段并回查媒体描述
         try:
             msg_detail = await get_message_detail(message_id)
             if msg_detail:
-                return await self._extract_message_preview(msg_detail)
+                preview = await self._extract_message_preview(msg_detail)
+                if preview and preview != "[消息]":
+                    return preview
         except Exception as e:
             logger.debug(f"获取消息详情失败: {e!s}")
 
-        return None
+        return db_preview or None
 
     async def _extract_message_preview(self, message_detail: dict[str, Any], depth: int = 0) -> str:
         """提取被表情回应消息的可读摘要，支持多层嵌套"""
@@ -775,7 +830,9 @@ class NoticeHandler:
                 face_id = str(seg_data.get("id", ""))
                 preview_parts.append(QQ_FACE.get(face_id, f"[表情{face_id}]"))
             elif seg_type == RealMessageType.image:
-                preview_parts.append("[图片]" if seg_data.get("sub_type") == 0 else "[表情包]")
+                preview_parts.append(
+                    await self._format_image_preview(seg_data)
+                )
             elif seg_type == RealMessageType.at:
                 at_name = seg_data.get("text") or seg_data.get("qq") or "未知对象"
                 preview_parts.append(f"@{at_name}")
@@ -796,10 +853,92 @@ class NoticeHandler:
                 preview_parts.append(f"[{seg_type}]")
 
         preview = "".join(preview_parts).strip() or "[消息]"
-        max_length = 60
-        if len(preview) > max_length:
-            preview = preview[:max_length] + "..."
-        return preview
+        # 含媒体占位符（[图片(hash):描述]）时放宽上限，保留完整 media_id；
+        # 纯文本预览维持较短限制
+        if preview.startswith(("[图片(", "[表情包(")):
+            return self._truncate_preview(preview, max_len=130)
+        return self._truncate_preview(preview)
+
+    async def _format_image_preview(self, seg_data: dict[str, Any]) -> str:
+        """格式化图片/表情包段预览，输出与框架多模态一致的占位符格式。
+
+        从图片段的 ``file``（可能带 ``base64://`` 前缀）或 ``url`` 获取
+        base64，计算媒体 SHA256，并经 ``media_api.recognize_media`` 命中
+        VLM 描述缓存。命中描述输出 ``[图片(sha256):描述]``，仅有哈希输出
+        ``[图片(sha256)]``，均无法获取时保留 ``[图片]`` 占位符。
+
+        Args:
+            seg_data: 图片段 data 字典
+
+        Returns:
+            格式化后的预览文本
+        """
+        is_emoji = seg_data.get("sub_type") != 0
+        label = "表情包" if is_emoji else "图片"
+        media_type = "emoji" if is_emoji else "image"
+
+        # 优先从图片段取到 base64（file 可能带 base64:// 前缀，url 需下载）
+        media_data: str | None = None
+        file_raw = str(seg_data.get("file") or "").strip()
+        if file_raw.startswith("base64://"):
+            media_data = file_raw[len("base64://"):]
+        elif file_raw.startswith(("http://", "https://")):
+            try:
+                media_data = await get_image_base64(file_raw)
+            except Exception as e:
+                logger.debug(f"下载图片失败: url={file_raw[:40]}, error={e!s}")
+        else:
+            url = str(seg_data.get("url") or "").strip()
+            if url and url.startswith(("http://", "https://")):
+                try:
+                    media_data = await get_image_base64(url)
+                except Exception as e:
+                    logger.debug(f"下载图片失败: url={url[:40]}, error={e!s}")
+
+        # 拿到 base64 后，计算媒体 SHA256 并回查 VLM 描述缓存，
+        # 输出与框架多模态一致的标准格式 [图片(sha256):描述] / [图片(sha256)]
+        if media_data:
+            try:
+                from src.core.managers.media_manager import MediaManager
+                from src.app.plugin_system.api import media_api
+
+                media_hash = MediaManager.compute_media_hash(media_data)
+                if media_hash:
+                    description = await media_api.recognize_media(
+                        base64_data=media_data,
+                        media_type=media_type,
+                        use_cache=True,
+                    )
+                    desc_text = (
+                        description.strip()
+                        if isinstance(description, str) and description.strip()
+                        else ""
+                    )
+                    # 预览用途，限制描述长度避免刷屏（媒体项整体可稍长以保留 hash）
+                    if desc_text:
+                        desc_text = self._truncate_preview(desc_text, max_len=40)
+                        return f"[{label}({media_hash}):{desc_text}]"
+                    return f"[{label}({media_hash})]"
+            except Exception as e:
+                logger.debug(f"识别媒体失败: error={e!s}")
+
+        return f"[{label}]"
+
+    @staticmethod
+    def _truncate_preview(text: str, max_len: int = 60) -> str:
+        """截断预览文本，超出部分以省略号结尾。
+
+        Args:
+            text: 原始文本
+            max_len: 最大长度
+
+        Returns:
+            截断后的文本
+        """
+        text = text.replace("\n", " ").replace("\r", " ")
+        if len(text) <= max_len:
+            return text
+        return text[:max_len] + "..."
 
     async def _handle_group_upload_notify(
         self, raw: dict[str, Any], group_id: Any, user_id: Any, self_id: Any
@@ -1005,14 +1144,20 @@ class NoticeHandler:
         else:
             logger.debug("无法获取入群者的群成员信息")
 
-        # 获取操作者信息（用于显示是谁批准/邀请的）
+        # 获取操作者信息（含群角色，用于显示是谁批准/邀请的）
         operator_name: str = "QQ用户"
+        operator_role: str = ""
         if operator_id and str(operator_id) != str(user_id):
             op_info: dict | None = await get_member_info(
                 int(group_id) if group_id else 0, int(operator_id) if operator_id else 0
             )
             if op_info:
                 operator_name = op_info.get("card") or op_info.get("nickname", "QQ用户")
+                op_role_raw = op_info.get("role", "")
+                if op_role_raw == "owner":
+                    operator_role = "群主"
+                elif op_role_raw == "admin":
+                    operator_role = "管理员"
         else:
             operator_name = user_nickname
 
@@ -1024,10 +1169,21 @@ class NoticeHandler:
             "role": "",  # type: ignore[typeddict-item]
         }
 
+        # 拼接入群者显示名（昵称 + QQ号）
+        user_display: str = f" {user_nickname}({user_id}) " if user_id else f" {user_nickname} "
+
+        # 拼接操作者显示名（[角色] + 昵称 + QQ号）
+        if operator_id and str(operator_id) != str(user_id):
+            role_prefix = f"[{operator_role}]" if operator_role else ""
+            operator_display = f" {role_prefix}{operator_name}({operator_id}) "
+        else:
+            operator_display = f" {operator_name} "
+
         action_text = "被邀请" if sub_type == "invite" else "通过审批"
+        operator_label = "邀请人" if sub_type == "invite" else "审批人"
         seg_data: SegPayload = {
             "type": "text",
-            "data": f"{user_nickname}加入了本群（{action_text}，审批人：{operator_name}）",
+            "data": f"{user_display}加入了本群（{action_text}，{operator_label}：{operator_display}）",
         }
         return seg_data, user_info
 
@@ -1094,7 +1250,7 @@ class NoticeHandler:
 
         # 拼接操作者显示名（角色 + 昵称 + QQ号）
         if sub_type in ("kick", "kick_me") and operator_id:
-            role_prefix = f"{operator_role}" if operator_role else ""
+            role_prefix = f"[{operator_role}]" if operator_role else ""
             operator_display = f" {role_prefix}{operator_name}({operator_id}) "
         else:
             operator_display = f" {operator_name} "
