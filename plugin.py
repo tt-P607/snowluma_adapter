@@ -51,9 +51,11 @@ class SnowLumaAdapter(BaseAdapter):
     """SnowLuma 适配器 - 完全基于 mofox-wire 架构"""
 
     name = "snowluma_adapter"
+    adapter_name = "snowluma_adapter"
     adapter_version = "2.0.0"
     adapter_author = "MoFox Team"
     description = "基于 MoFox-Bus 的 SnowLuma 11 适配器"
+    adapter_description = "基于 MoFox-Bus 的 SnowLuma 11 适配器"
     platform = "qq"
 
     run_in_subprocess = False

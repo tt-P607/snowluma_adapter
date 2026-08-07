@@ -428,23 +428,41 @@ class SendHandler:
         result_seg = [at_seg, text_seg]
         return result_seg
 
+    def _to_snowluma_base64(self, value: str) -> str:
+        """将框架媒体数据归一化为 SnowLuma 可识别的 file 字段值。
+
+        框架内部以 ``base64|`` 前缀下发 base64 数据（见
+        ``normalize_base64``），SnowLuma 则要求 ``base64://`` 前缀。
+        此处剥离 ``base64|`` 前缀并补 ``base64://``，避免生成
+        ``base64://base64|...`` 双重前缀导致 SnowLuma 无法打开输入。
+
+        Args:
+            value: 媒体数据，可为带 ``base64|`` / ``base64://`` 前缀的
+                base64 字符串，或 HTTP/HTTPS URL。
+
+        Returns:
+            str: 归一化后的 file 字段值。
+        """
+        if value.startswith("base64|"):
+            return f"base64://{value[len('base64|'):]}"
+        if value.startswith(("base64://", "http://", "https://")):
+            return value
+        return f"base64://{value}"
+
     def handle_image_message(self, encoded_image: str) -> dict:
         """处理图片消息。
 
         Args:
             encoded_image: 图片数据。可以是：
                 - 原始 base64 字符串（不含前缀，自动补 base64://）
-                - 已含 base64:// 前缀的字符串（直接透传，不重复添加前缀）
+                - 已含 base64| / base64:// 前缀的字符串（剥离框架前缀，
+                  统一为 base64://）
                 - HTTP/HTTPS URL（直接透传，snowluma 会自行拉取）
         """
-        if encoded_image.startswith(("base64://", "http://", "https://")):
-            file_value = encoded_image
-        else:
-            file_value = f"base64://{encoded_image}"
         return {
             "type": "image",
             "data": {
-                "file": file_value,
+                "file": self._to_snowluma_base64(encoded_image),
                 "subtype": 0,
             },
         }
@@ -458,7 +476,7 @@ class SendHandler:
         return {
             "type": "image",
             "data": {
-                "file": f"base64://{encoded_image}" if not encoded_image.startswith(("base64://", "http://", "https://")) else encoded_image,
+                "file": self._to_snowluma_base64(encoded_image),
                 "subtype": 1,
                 "summary": "[动画表情]",
             },
@@ -469,13 +487,9 @@ class SendHandler:
         if not encoded_voice:
             logger.warning("接收到空的语音消息，跳过处理")
             return {}
-        if encoded_voice.startswith(("base64://", "http://", "https://")):
-            file_value = encoded_voice
-        else:
-            file_value = f"base64://{encoded_voice}"
         return {
             "type": "record",
-            "data": {"file": file_value},
+            "data": {"file": self._to_snowluma_base64(encoded_voice)},
         }
 
     def handle_voiceurl_message(self, voice_url: str) -> dict:
