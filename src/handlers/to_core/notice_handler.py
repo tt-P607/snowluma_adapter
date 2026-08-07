@@ -1322,9 +1322,11 @@ class NoticeHandler:
         }
 
         action_text = "被任命为管理员" if sub_type == "set" else "被取消了管理员"
+        # 附带 QQ 号便于识别，格式与其他群通知一致：昵称(QQ号)动作
+        user_display = f"{user_nickname}({user_id})" if user_id else user_nickname
         seg_data: SegPayload = {
             "type": "text",
-            "data": f"{user_nickname}{action_text}",
+            "data": f"{user_display}{action_text}",
         }
         return seg_data, user_info
 
