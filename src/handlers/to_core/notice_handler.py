@@ -271,24 +271,36 @@ class NoticeHandler:
                 or user_info.get("user_cardname")
                 or "某人"
             )
+            operator_id = user_info.get("user_id") or ""
+            operator_display = (
+                f"{operator_name}({operator_id})" if operator_id else operator_name
+            )
             sub_type_in_data = seg_data_content.get("sub_type", "")
             if sub_type_in_data == "ban":
                 banned = seg_data_content.get("banned_user_info") or {}
                 banned_name = banned.get("user_nickname") or "某人"
+                banned_id = banned.get("user_id") or ""
+                banned_display = (
+                    f"{banned_name}({banned_id})" if banned_id else banned_name
+                )
                 duration = seg_data_content.get("duration", 0)
                 notice_config["text_description"] = (
-                    f"{operator_name}将{banned_name}禁言了{duration}秒"
+                    f"{operator_display}将{banned_display}禁言了{duration}秒"
                 )
             elif sub_type_in_data == "whole_ban":
-                notice_config["text_description"] = f"{operator_name}开启了全体禁言"
+                notice_config["text_description"] = f"{operator_display}开启了全体禁言"
             elif sub_type_in_data == "lift_ban":
                 lifted = seg_data_content.get("lifted_user_info") or {}
                 lifted_name = lifted.get("user_nickname") or "某人"
+                lifted_id = lifted.get("user_id") or ""
+                lifted_display = (
+                    f"{lifted_name}({lifted_id})" if lifted_id else lifted_name
+                )
                 notice_config["text_description"] = (
-                    f"{operator_name}解除了{lifted_name}的禁言"
+                    f"{operator_display}解除了{lifted_display}的禁言"
                 )
             elif sub_type_in_data == "whole_lift_ban":
-                notice_config["text_description"] = f"{operator_name}关闭了全体禁言"
+                notice_config["text_description"] = f"{operator_display}关闭了全体禁言"
             else:
                 notice_config["text_description"] = str(seg_data_content)
         else:
@@ -480,8 +492,12 @@ class NoticeHandler:
             except Exception as e:
                 logger.debug(f"获取撤回消息内容失败: {e!s}")
 
+        # 操作者附带 QQ 号便于识别，格式与其他群通知一致
+        operator_display = (
+            f"{operator_name}({operator_id})" if operator_id else operator_name
+        )
         # 构建撤回通知文本
-        recall_text = f"[notice] 撤回 {operator_name}撤回了消息[{recall_msg_id}]"
+        recall_text = f"[notice] 撤回 {operator_display}撤回了消息[{recall_msg_id}]"
         if msg_preview:
             recall_text += f": {msg_preview}"
 
@@ -973,9 +989,11 @@ class NoticeHandler:
         file_name = file_info.get("name", "未知文件")
         file_size = file_info.get("size", 0)
 
+        # 附带 QQ 号便于识别，格式与其他群通知一致
+        user_display = f"{user_name}({user_id})" if user_id else user_name
         seg_data: SegPayload = {
             "type": "text",
-            "data": f"{user_name} 上传了文件: {file_name} (大小: {file_size} 字节)",
+            "data": f"{user_display} 上传了文件: {file_name} (大小: {file_size} 字节)",
         }
         return seg_data, user_info
 
@@ -1395,11 +1413,16 @@ class NoticeHandler:
             except Exception as e:
                 logger.debug(f"获取精华消息内容失败: {e!s}")
 
+        # 操作者与被操作消息发送者均附带 QQ 号便于识别
+        operator_display = (
+            f"{operator_nickname}({operator_id})" if operator_id else operator_nickname
+        )
+        sender_display = f"{sender_nickname}({user_id})" if user_id else sender_nickname
         action_text = "设置了精华消息" if sub_type == "add" else "移除了精华消息"
         if msg_preview:
-            content = f"{operator_nickname}{action_text}（{sender_nickname}的消息：{msg_preview}）"
+            content = f"{operator_display}{action_text}（{sender_display}的消息：{msg_preview}）"
         else:
-            content = f"{operator_nickname}{action_text}（消息发送者：{sender_nickname}）"
+            content = f"{operator_display}{action_text}（消息发送者：{sender_display}）"
         seg_data: SegPayload = {
             "type": "text",
             "data": content,
