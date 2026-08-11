@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -770,9 +771,17 @@ class MessageHandler:
             sender_info: dict = sub_message.get("sender", {})
             user_nickname: str = sender_info.get("nickname") or sender_info.get("card") or "QQ用户"
             user_id: str = str(sender_info.get("user_id") or "")
+            # 节点自带 Unix 时间戳（秒），格式化后附加到昵称后，便于识别被转发消息的发送时间
+            node_time = sub_message.get("time")
+            time_str = ""
+            if node_time:
+                try:
+                    time_str = f"[{datetime.fromtimestamp(float(node_time)).strftime('%Y-%m-%d %H:%M:%S')}]"
+                except (TypeError, ValueError, OSError, OverflowError):
+                    logger.debug(f"转发消息节点时间戳无效: {node_time}")
             user_nickname_str = f"【{user_nickname}({user_id})】:" if user_id else f"【{user_nickname}】:"
             break_seg: SegPayload = {"type": "text", "data": "\n"}
-            nickname_prefix = ("--" * layer) + user_nickname_str if layer > 0 else user_nickname_str
+            nickname_prefix = ("--" * layer) + user_nickname_str + time_str if layer > 0 else user_nickname_str + time_str
             message_of_sub_message_list: list[dict[str, Any]] = sub_message.get("message", [])
             if not message_of_sub_message_list:
                 logger.warning("转发消息内容为空")
