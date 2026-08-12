@@ -52,7 +52,6 @@ class SnowLumaAdapter(BaseAdapter):
 
     name = "snowluma_adapter"
     adapter_name = "snowluma_adapter"
-    adapter_version = "2.0.0"
     adapter_author = "MoFox Team"
     description = "基于 MoFox-Bus 的 SnowLuma 11 适配器"
     adapter_description = "基于 MoFox-Bus 的 SnowLuma 11 适配器"
@@ -478,8 +477,6 @@ class SnowLumaAdapterPlugin(BasePlugin):
     """SnowLuma 适配器插件"""
 
     plugin_name = "snowluma_adapter"
-    plugin_author = "MoFox Team"
-    plugin_description = "SnowLuma 11 适配器（基于 Neo-MoFox 重写）"
     configs: list[type] = [SnowLumaAdapterConfig]
 
 
