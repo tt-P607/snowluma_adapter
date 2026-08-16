@@ -682,6 +682,14 @@ class MessageHandler:
         return {"type": "text", "data": f"[扔了一个骰子，点数是{res}]"}
 
 
+    def _get_forward_max_depth(self) -> int:
+        """获取转发消息最大递归解析层数。"""
+        default_depth = 3
+        if not self.adapter.plugin or not self.adapter.plugin.config:
+            return default_depth
+        config = cast(SnowLumaAdapterConfig, self.adapter.plugin.config)
+        return max(1, int(config.features.forward_max_depth))
+
     async def handle_forward_message(self, message_list: list[dict[str, Any]]) -> SegPayload | None:
         """
         递归处理转发消息，并按照动态方式确定图片处理方式
@@ -792,7 +800,7 @@ class MessageHandler:
             for msg_seg in message_of_sub_message_list:
                 msg_type = msg_seg.get("type")
                 if msg_type == RealMessageType.forward:
-                    if layer >= 3:
+                    if layer >= self._get_forward_max_depth():
                         sub_segs.append({"type": "text", "data": "【转发消息】\n"})
                     else:
                         sub_seg_data = msg_seg.get("data")
@@ -835,6 +843,10 @@ class MessageHandler:
                         sub_segs.append({"type": "image", "data": image_url})
                     else:
                         sub_segs.append({"type": "emoji", "data": image_url})
+                elif msg_type == RealMessageType.file:
+                    file_seg = await self._handle_file_message(msg_seg)
+                    if file_seg is not None:
+                        sub_segs.append(file_seg)
                 else:
                     logger.debug(f"合并转发中未处理段类型: {msg_type}")
 

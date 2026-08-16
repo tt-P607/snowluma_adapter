@@ -231,6 +231,15 @@ class SnowLumaAdapterConfig(BaseConfig):
             depends_on="enable_video_processing",
             depends_value=True
         )
+        forward_max_depth: int = Field(
+            default=5,
+            description="转发消息最多递归解析的嵌套层数",
+            label="转发消息最大层数",
+            ge=1,
+            le=10,
+            input_type="slider",
+            tag="general"
+        )
 
     plugin: PluginSection = Field(default_factory=PluginSection)
     bot: BotSection = Field(default_factory=BotSection)
