@@ -28,6 +28,7 @@ from .src.handlers import utils as handler_utils
 from .src.handlers.to_core.message_handler import MessageHandler
 from .src.handlers.to_core.meta_event_handler import MetaEventHandler
 from .src.handlers.to_core.notice_handler import NoticeHandler
+from .src.handlers.to_core.request_handler import RequestHandler
 from .src.handlers.to_snowluma.send_handler import SendHandler
 logger = get_logger("snowluma_adapter")
 
@@ -95,6 +96,7 @@ class SnowLumaAdapter(BaseAdapter):
         # 初始化处理器
         self.message_handler = MessageHandler(self)
         self.notice_handler = NoticeHandler(self)
+        self.request_handler = RequestHandler(self)
         self.meta_event_handler = MetaEventHandler(self)
         self.send_handler = SendHandler(self)
 
@@ -136,7 +138,7 @@ class SnowLumaAdapter(BaseAdapter):
         if post_type == "message":
             sender_info = raw.get("sender", {})
             user_id = str(sender_info.get("user_id", ""))
-        elif post_type == "notice":
+        elif post_type in ("notice", "request"):
             user_id = str(raw.get("user_id", ""))
         else:
             # 元事件或其他类型不需要过滤
@@ -152,8 +154,8 @@ class SnowLumaAdapter(BaseAdapter):
         message_type = raw.get("message_type")
         group_id = raw.get("group_id")
 
-        # 如果是通知事件，根据是否有 group_id 判断是群通知还是私聊通知
-        if post_type == "notice":
+        # 如果是通知或请求事件，根据是否有 group_id 判断是群还是私聊
+        if post_type in ("notice", "request"):
             message_type = "group" if group_id else "private"
 
         # 群聊/群通知过滤
@@ -362,6 +364,10 @@ class SnowLumaAdapter(BaseAdapter):
             elif post_type == "notice":
                 await self.notice_handler.handle_notice(raw)
                 return None
+
+            # 请求事件（加群申请、群邀请、好友申请）
+            elif post_type == "request":
+                return await self.request_handler.handle_request(raw)
 
             # 元事件
             elif post_type == "meta_event":

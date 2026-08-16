@@ -66,6 +66,15 @@ class NoticeType:  # 通知事件
         delete = "delete"  # 移除精华
 
 
+class RequestType:  # 请求事件
+    friend = "friend"  # 好友申请
+    group = "group"  # 加群申请
+
+    class Group:
+        add = "add"  # 申请加群
+        invite = "invite"  # 邀请加群
+
+
 class RealMessageType:  # 实际消息分类
     text = "text"  # 纯文本
     face = "face"  # qq表情
@@ -366,4 +375,5 @@ __all__ = [
     "MetaEventType",
     "NoticeType",
     "RealMessageType",
+    "RequestType",
 ]
