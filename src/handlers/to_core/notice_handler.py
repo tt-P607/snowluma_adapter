@@ -117,6 +117,15 @@ class NoticeHandler:
                         # 正在输入状态通知，无需处理
                         return
 
+                    case NoticeType.Notify.title:
+                        logger.info("[#FAB387]群头衔变更[/#FAB387]")
+                        handled_segment, user_info = await self._handle_title_notify(raw, group_id, user_id)
+                        if handled_segment and user_info:
+                            notice_config["notice_type"] = "title"
+                            notice_config["is_notice"] = True
+                        else:
+                            return
+
                     case _:
                         logger.warning(f"不支持的notify类型: {notice_type}.{sub_type}，将原始数据包装为消息后抛出")
                         handled_segment, user_info = await self._handle_raw_passthrough(raw, notice_type)
@@ -345,6 +354,7 @@ class NoticeHandler:
             "group_decrease": "退群",
             "group_admin": "管理员变动",
             "essence": "精华消息",
+            "title": "头衔",
         }
         _notice_type_str = str(notice_config.get("notice_type", "notice"))
         _type_label = _NOTICE_TYPE_LABELS.get(_notice_type_str, _notice_type_str)
@@ -1423,6 +1433,65 @@ class NoticeHandler:
             content = f"{operator_display}{action_text}（{sender_display}的消息：{msg_preview}）"
         else:
             content = f"{operator_display}{action_text}（消息发送者：{sender_display}）"
+        seg_data: SegPayload = {
+            "type": "text",
+            "data": content,
+        }
+        return seg_data, user_info
+
+    async def _handle_title_notify(
+        self, raw: dict[str, Any], group_id: Any, user_id: Any
+    ) -> tuple[SegPayload | None, UserInfoPayload | None]:
+        """处理群头衔变更通知。
+
+        OneBot v11 ``notify.title`` 事件字段：
+        - ``sub_type``: ``title``（群头衔变更）
+        - ``user_id``: 被授予头衔的成员
+        - ``special_title``: 头衔文本（空字符串表示清除头衔）
+
+        Args:
+            raw: 原始通知数据
+            group_id: 群 ID
+            user_id: 被授予头衔的成员 user_id
+
+        Returns:
+            text 消息段与被授予头衔成员的用户信息；处理失败返回 None。
+        """
+        if not group_id:
+            logger.warning("群ID为空，无法处理群头衔变更通知")
+            return None, None
+
+        # 获取被授予头衔成员信息
+        user_nickname: str = "QQ用户"
+        user_cardname: str = ""
+        member_info: dict | None = await get_member_info(
+            int(group_id) if group_id else 0, int(user_id) if user_id else 0
+        )
+        if member_info:
+            user_nickname = member_info.get("nickname", "QQ用户")
+            user_cardname = sanitize_text(member_info.get("card", "")) or ""
+        else:
+            logger.debug("无法获取被授予头衔成员的群成员信息")
+
+        user_info: UserInfoPayload = {
+            "platform": "qq",
+            "user_id": str(user_id),
+            "user_nickname": user_nickname,
+            "user_cardname": user_cardname,
+            "role": "",  # type: ignore[typeddict-item]
+        }
+
+        # 头衔文本可能携带在 special_title 或 title 字段，空字符串表示清除头衔
+        special_title = raw.get("special_title", raw.get("title", ""))
+        user_display = (
+            f"{user_cardname or user_nickname}({user_id})"
+            if user_id
+            else (user_cardname or user_nickname)
+        )
+        if special_title:
+            content = f"{user_display}被授予了头衔【{special_title}】"
+        else:
+            content = f"{user_display}的头衔被清除了"
         seg_data: SegPayload = {
             "type": "text",
             "data": content,

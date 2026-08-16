@@ -42,6 +42,7 @@ class NoticeType:  # 通知事件
     class Notify:
         poke = "poke"  # 戳一戳
         input_status = "input_status"  # 正在输入
+        title = "title"  # 群头衔变更
 
     class GroupBan:
         ban = "ban"  # 禁言
