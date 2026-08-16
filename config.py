@@ -231,6 +231,18 @@ class SnowLumaAdapterConfig(BaseConfig):
             depends_on="enable_video_processing",
             depends_value=True
         )
+        forward_image_threshold: int = Field(
+            default=5,
+            description=(
+                "转发消息内解析为 base64 的图片数量上限；超出该数量的图片"
+                "替换为占位符。设为 0 表示始终使用占位符"
+            ),
+            label="转发图片解析上限",
+            ge=0,
+            le=50,
+            input_type="slider",
+            tag="general"
+        )
         forward_max_depth: int = Field(
             default=5,
             description="转发消息最多递归解析的嵌套层数",

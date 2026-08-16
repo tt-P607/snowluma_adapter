@@ -202,7 +202,7 @@ class MessageHandler:
                 if not messages:
                     logger.warning("转发消息内容为空或获取失败")
                     return None
-                return await self.handle_forward_message(messages)  # type: ignore[arg-type]
+                return await self.handle_forward_message(messages, raw_message)  # type: ignore[arg-type]
             case RealMessageType.json:
                 return await self._handle_json_message(segment)
             case RealMessageType.contact:
@@ -690,26 +690,42 @@ class MessageHandler:
         config = cast(SnowLumaAdapterConfig, self.adapter.plugin.config)
         return max(1, int(config.features.forward_max_depth))
 
-    async def handle_forward_message(self, message_list: list[dict[str, Any]]) -> SegPayload | None:
+    def _get_forward_image_threshold(self) -> int:
+        """获取转发消息内解析为 base64 的图片数量上限。"""
+        default_threshold = 5
+        if not self.adapter.plugin or not self.adapter.plugin.config:
+            return default_threshold
+        config = cast(SnowLumaAdapterConfig, self.adapter.plugin.config)
+        return max(0, int(config.features.forward_image_threshold))
+
+    async def handle_forward_message(
+        self,
+        message_list: list[dict[str, Any]],
+        raw_message: dict[str, Any] | None = None,
+    ) -> SegPayload | None:
         """
-        递归处理转发消息，并按照动态方式确定图片处理方式
+        递归处理转发消息，并按配置动态确定图片处理方式。
+
+        图片总数未超过阈值时全部解析为 base64；超过阈值时仅前若干张解析
+        为 base64，其余替换为占位符，避免一次性嵌入大量 base64 撑爆上下文。
 
         Args:
             message_list: 转发消息列表
+            raw_message: 最外层原始消息，用于转发内语音/@等段的上下文解析
 
         Returns:
             处理后的消息段，失败返回 None
         """
-        handled_message, image_count = await self._handle_forward_message(message_list, 0)
+        handled_message, image_count = await self._handle_forward_message(message_list, 0, raw_message)
         if not handled_message:
             return None
 
-        if 0 < image_count < 5:
-            logger.debug("图片数量小于5，开始解析图片为base64")
-            processed_message = await self._recursive_parse_image_seg(handled_message, True)
-        elif image_count > 0:
-            logger.debug("图片数量大于等于5，开始解析图片为占位符")
-            processed_message = await self._recursive_parse_image_seg(handled_message, False)
+        image_threshold = self._get_forward_image_threshold()
+        if image_count > 0:
+            logger.debug(
+                f"图片数量({image_count})，解析上限({image_threshold})，前{image_threshold}张解析为base64"
+            )
+            processed_message, _ = await self._recursive_parse_image_seg(handled_message, image_threshold)
         else:
             logger.debug("没有图片，直接返回")
             processed_message = handled_message
@@ -721,45 +737,58 @@ class MessageHandler:
         return {"type": "seglist", "data": [forward_hint, processed_message]}  # type: ignore[return-value]
 
     async def _recursive_parse_image_seg(
-        self, seg_data: SegPayload, to_image: bool
-    ) -> SegPayload:
-        # sourcery skip: merge-else-if-into-elif
+        self, seg_data: SegPayload, remain: int = 0
+    ) -> tuple[SegPayload, int]:
+        """递归处理转发消息内的图片段。
+
+        最多将 ``remain`` 张图片解析为 base64；配额耗尽后其余图片与表情
+        替换为占位符，其余消息段原样透传。通过返回值回传剩余配额，
+        保证嵌套 seglist 跨层累计计数正确。
+
+        Args:
+            seg_data: 待处理的消息段（可为 seglist 嵌套结构）
+            remain: 剩余可解析为 base64 的图片数量
+
+        Returns:
+            处理后的消息段与剩余配额
+        """
         if seg_data.get("type") == "seglist":
             new_seg_list = []
             for i_seg in seg_data.get("data", []):
-                parsed_seg = await self._recursive_parse_image_seg(i_seg, to_image)  # type: ignore[arg-type]
+                parsed_seg, remain = await self._recursive_parse_image_seg(i_seg, remain)  # type: ignore[arg-type]
                 new_seg_list.append(parsed_seg)
-            return {"type": "seglist", "data": new_seg_list}
-
-        if to_image:
-            if seg_data.get("type") == "image":
-                image_url = seg_data.get("data")
-                try:
-                    encoded_image = await get_image_base64(str(image_url))
-                except Exception as e:
-                    logger.error(f"图片处理失败: {e!s}")
-                    return {"type": "text", "data": "[图片]"}
-                return {"type": "image", "data": encoded_image}
-            if seg_data.get("type") == "emoji":
-                image_url = seg_data.get("data")
-                try:
-                    encoded_image = await get_image_base64(str(image_url))
-                except Exception as e:
-                    logger.error(f"图片处理失败: {e!s}")
-                    return {"type": "text", "data": "[表情包]"}
-                return {"type": "emoji", "data": encoded_image}
-            logger.debug(f"不处理类型: {seg_data.get('type')}")
-            return seg_data
+            return {"type": "seglist", "data": new_seg_list}, remain
 
         if seg_data.get("type") == "image":
-            return {"type": "text", "data": "[图片]"}
+            if remain > 0:
+                image_url = seg_data.get("data")
+                try:
+                    encoded_image = await get_image_base64(str(image_url))
+                except Exception as e:
+                    logger.error(f"图片处理失败: {e!s}")
+                    return {"type": "text", "data": "[图片]"}, remain - 1
+                return {"type": "image", "data": encoded_image}, remain - 1
+            return {"type": "text", "data": "[图片]"}, remain
+
         if seg_data.get("type") == "emoji":
-            return {"type": "text", "data": "[动画表情]"}
+            if remain > 0:
+                image_url = seg_data.get("data")
+                try:
+                    encoded_image = await get_image_base64(str(image_url))
+                except Exception as e:
+                    logger.error(f"图片处理失败: {e!s}")
+                    return {"type": "text", "data": "[表情包]"}, remain - 1
+                return {"type": "emoji", "data": encoded_image}, remain - 1
+            return {"type": "text", "data": "[动画表情]"}, remain
+
         logger.debug(f"不处理类型: {seg_data.get('type')}")
-        return seg_data
+        return seg_data, remain
 
     async def _handle_forward_message(
-        self, message_list: list[dict[str, Any]] | None, layer: int
+        self,
+        message_list: list[dict[str, Any]] | None,
+        layer: int,
+        raw_message: dict[str, Any] | None = None,
     ) -> tuple[SegPayload | None, int]:
         # sourcery skip: low-code-quality
         """
@@ -767,6 +796,7 @@ class MessageHandler:
         Parameters:
             message_list: list: 转发消息列表，首层对应messages字段，后面对应content字段
             layer: int: 当前层级
+            raw_message: dict | None: 最外层原始消息，用于转发内语音/@等段的上下文解析
         Returns:
             seg_data: Seg: 处理后的消息段
             image_count: int: 图片数量
@@ -815,7 +845,7 @@ class MessageHandler:
                                 logger.warning(f"嵌套转发消息获取失败(layer={layer})，使用占位符: id={sub_seg_data.get('id')}")
                                 sub_segs.append({"type": "text", "data": "【转发消息】\n"})
                                 continue
-                        seg_data_opt, count = await self._handle_forward_message(contents, layer + 1)
+                        seg_data_opt, count = await self._handle_forward_message(contents, layer + 1, raw_message)
                         if seg_data_opt is None:
                             continue
                         image_count += count
@@ -847,6 +877,22 @@ class MessageHandler:
                     file_seg = await self._handle_file_message(msg_seg)
                     if file_seg is not None:
                         sub_segs.append(file_seg)
+                elif msg_type == RealMessageType.record:
+                    record_seg = await self._handle_record_message(msg_seg, raw_message or {})
+                    if record_seg is not None:
+                        sub_segs.append(record_seg)
+                elif msg_type == RealMessageType.video:
+                    video_seg = await self._handle_video_message(msg_seg)
+                    if video_seg is not None:
+                        sub_segs.append(video_seg)
+                elif msg_type == RealMessageType.at:
+                    at_seg = await self._handle_at_message(msg_seg, raw_message or {})
+                    if at_seg is not None:
+                        sub_segs.append(at_seg)
+                elif msg_type == RealMessageType.face:
+                    face_seg = await self._handle_face_message(msg_seg)
+                    if face_seg is not None:
+                        sub_segs.append(face_seg)
                 else:
                     logger.debug(f"合并转发中未处理段类型: {msg_type}")
 
