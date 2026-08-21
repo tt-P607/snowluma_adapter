@@ -468,7 +468,22 @@ class SendHandler:
         }
 
     async def handle_emoji_message(self, encoded_emoji: str) -> dict:
-        """处理表情消息"""
+        """处理表情消息。
+
+        URL/已带 base64:// 前缀的数据直接透传；框架 ``base64|`` 前缀
+        剥离后再做格式嗅探，避免前缀字符进入 base64 解码。
+        """
+        if encoded_emoji.startswith(("base64://", "http://", "https://", "file://")):
+            return {
+                "type": "image",
+                "data": {
+                    "file": encoded_emoji,
+                    "subtype": 1,
+                    "summary": "[动画表情]",
+                },
+            }
+        if encoded_emoji.startswith("base64|"):
+            encoded_emoji = encoded_emoji[len("base64|"):]
         encoded_image = encoded_emoji
         image_format = await get_image_format(encoded_emoji)
         if image_format != "gif":
