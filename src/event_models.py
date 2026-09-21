@@ -171,6 +171,7 @@ ACCEPT_FORMAT = [
     "command",
     "voiceurl",
     "music",
+    "video",
     "videourl",
     "file",
 ]

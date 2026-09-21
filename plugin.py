@@ -377,10 +377,10 @@ class SnowLumaAdapter(BaseAdapter):
             else:
                 return None
         except ValueError as ve:
-            logger.warning(f"处理 SnowLuma 事件时数据无效: {ve}")
+            logger.warning(f"处理 SnowLuma 事件时数据无效: {type(ve).__name__}")
             return None
         except Exception as e:
-            logger.error(f"处理 SnowLuma 事件失败: {e}, 原始数据: {raw}")
+            logger.error(f"处理 SnowLuma 事件失败: {type(e).__name__}")
             return None
 
     async def _send_platform_message(self, envelope: MessageEnvelope) -> PlatformSendResult:  # type: ignore[override]

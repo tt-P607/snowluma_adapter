@@ -1170,7 +1170,7 @@ class MessageHandler:
         except orjson.JSONDecodeError:
             # 如果解析失败，我们假设它不是我们关心的任何一种结构化JSON，
             # 而是普通的文本或者无法解析的格式。
-            logger.debug(f"无法将data字段解析为JSON: {json_data}")
+            logger.debug(f"无法将data字段解析为JSON: 数据长度={len(json_data)}")
             return None
         except Exception as e:
             logger.error(f"处理JSON消息时发生未知错误: {e}")

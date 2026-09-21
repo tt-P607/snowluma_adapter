@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import random
+import string
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from mofox_wire import GroupInfoPayload, MessageEnvelope, MessageInfoPayload, SegPayload, UserInfoPayload
@@ -30,6 +32,10 @@ class SendHandler:
 
         Returns:
             str | None: 发送成功且平台返回了消息 ID 时返回该 ID，否则返回 None
+
+        Raises:
+            ValueError: 消息段无法解析或缺少可识别的发送目标
+            RuntimeError: SnowLuma 返回失败响应
         """
         logger.debug("接收到来自MoFox-Bot的消息，处理中")
 
@@ -66,6 +72,10 @@ class SendHandler:
 
         Returns:
             str | None: 发送成功且平台返回了消息 ID 时返回该 ID，否则返回 None
+
+        Raises:
+            ValueError: 消息段无法解析或缺少可识别的发送目标
+            RuntimeError: SnowLuma 返回失败响应
         """
         message_info: MessageInfoPayload = envelope.get("message_info", {})
         message_segment: SegPayload = envelope.get("message_segment", {})  # type: ignore[assignment]
@@ -84,12 +94,11 @@ class SendHandler:
         try:
             processed_message = await self.handle_seg_recursive(seg_data, user_info or {}, group_info)  # type: ignore[arg-type]
         except Exception as e:
-            logger.error(f"处理消息时发生错误: {e}")
-            return None
+            logger.error(f"处理消息段时发生错误: {e}")
+            raise
 
         if not processed_message:
-            logger.critical("现在暂时不支持解析此回复！")
-            return None
+            raise ValueError("消息未解析出任何可发送内容，可能是消息段类型不受支持")
 
         # 🔧 确保 reply 消息段始终在列表最前面
         # 排序原则：reply 类型优先级最高（排序值为 0），其他类型保持原有顺序（排序值为 1）
@@ -107,11 +116,9 @@ class SendHandler:
             action = "send_private_msg"
             id_name = "user_id"
         else:
-            logger.error("无法识别的消息类型")
-            return None
+            raise ValueError("无法识别的发送目标：群聊缺少 group_info，私聊缺少 user_info")
         logger.debug(
-            f"准备发送到 snowluma 的消息体: action='{action}', {id_name}='{target_id}', "
-            f"message={str(processed_message)[:500]}"
+            f"准备发送 SnowLuma 消息: action={action}, 消息段数量={len(processed_message)}"
         )
         response = await self.send_message_to_snowluma(
             action or "",
@@ -121,8 +128,9 @@ class SendHandler:
             },
         )
         if response.get("status") != "ok":
-            logger.warning(f"消息发送失败，snowluma返回：{response!s}")
-            return None
+            raise RuntimeError(
+                f"SnowLuma 消息发送失败: retcode={str(response.get('retcode'))[:32]}"
+            )
 
         logger.info("消息发送成功")
 
@@ -198,14 +206,15 @@ class SendHandler:
             logger.error("命令或参数缺失")
             return None
 
-        logger.debug(f"准备向 SnowLuma 发送命令: command='{command}', args_dict='{args_dict}'")
+        logger.debug(f"准备向 SnowLuma 发送命令: command={command}")
         response = await self.send_message_to_snowluma(command, args_dict)
-        logger.debug(f"收到 SnowLuma 的命令响应: {response}")
 
         if response.get("status") == "ok":
             logger.info(f"命令 {command_name} 执行成功")
         else:
-            logger.warning(f"命令 {command_name} 执行失败，snowluma返回：{response!s}")
+            logger.warning(
+                f"命令 {command_name} 执行失败: retcode={str(response.get('retcode'))[:32]}"
+            )
 
     async def handle_adapter_command(self, envelope: MessageEnvelope) -> None:
         """
@@ -258,8 +267,9 @@ class SendHandler:
             if response.get("status") == "ok":
                 logger.info(f"适配器命令 {action} 执行成功")
             else:
-                logger.warning(f"适配器命令 {action} 执行失败，snowluma返回：{response!s}")
-            logger.debug(f"适配器命令 {action} 的完整响应: {response}")
+                logger.warning(
+                    f"适配器命令 {action} 执行失败: retcode={str(response.get('retcode'))[:32]}"
+                )
 
         except Exception as e:
             logger.error(f"处理适配器命令时发生错误: {e}")
@@ -322,6 +332,12 @@ class SendHandler:
         elif seg_type == "music":
             song_id = seg.get("data")
             new_payload = self.build_payload(payload, self.handle_music_message(str(song_id)), False)
+        elif seg_type == "video":
+            video = seg.get("data")
+            if video:
+                new_payload = self.build_payload(payload, self.handle_video_message(str(video)), False)
+            else:
+                logger.warning("video 消息段缺少 data 字段")
         elif seg_type == "videourl":
             video_url = seg.get("data")
             new_payload = self.build_payload(payload, self.handle_videourl_message(str(video_url)), False)
@@ -385,7 +401,7 @@ class SendHandler:
 
         try:
             msg_info_response = await self.send_message_to_snowluma("get_msg", {"message_id": message_id})
-            logger.debug(f"获取消息 {message_id} 的详情响应: {msg_info_response}")
+            logger.debug(f"获取引用消息详情: success={msg_info_response.get('status') == 'ok'}")
 
             replied_user_id = None
             if msg_info_response and msg_info_response.get("status") == "ok":
@@ -448,6 +464,100 @@ class SendHandler:
         if value.startswith(("base64://", "http://", "https://")):
             return value
         return f"base64://{value}"
+
+    #: 标准 base64 字母表（不含 base64url 的 ``-`` / ``_``）
+    _BASE64_ALPHABET = frozenset(string.ascii_letters + string.digits + "+/")
+
+    @classmethod
+    def _looks_like_base64(cls, value: str) -> bool:
+        """判断字符串是否为标准 base64 数据。
+
+        用于区分真正的 base64 与「被框架 ``normalize_base64`` 误加
+        ``base64|`` 前缀的本地文件路径」：文件路径含 ``\\``、``:``、``.``、``_``
+        等字符，不可能出现在标准 base64 中。
+
+        Args:
+            value: 已剥离 ``base64|`` 前缀的内容。
+
+        Returns:
+            bool: 是否为标准 base64。
+        """
+        if not value or len(value) % 4 != 0:
+            return False
+        return all(ch in cls._BASE64_ALPHABET or ch == "=" for ch in value)
+
+    def _is_wsl_path_mode(self) -> bool:
+        """当前是否把本地文件路径转换为 WSL/Docker 挂载路径。"""
+        config = self.adapter.plugin.config if self.adapter.plugin else None
+        if config and hasattr(config, "features"):
+            return bool(config.features.wsl_mode)  # type: ignore[attr-defined]
+        return False
+
+    @staticmethod
+    def _to_local_mount_path(path: str) -> str:
+        """把 Windows 盘符路径转换为 WSL/Docker 挂载路径。
+
+        ``E:\\MoFox-Bot\\a.mp4`` → ``/mnt/e/MoFox-Bot/a.mp4``；
+        非盘符路径仅统一分隔符后原样返回。
+
+        Args:
+            path: 原始路径。
+
+        Returns:
+            str: 转换后的路径。
+        """
+        normalized = path.replace("\\", "/")
+        if len(normalized) >= 2 and normalized[1] == ":":
+            return f"/mnt/{normalized[0].lower()}{normalized[2:]}"
+        return normalized
+
+    def _to_snowluma_local_uri(self, value: str) -> str:
+        """把本地文件路径转为 SnowLuma 运行环境可解析的 ``file://`` URI。
+
+        已为 POSIX 绝对路径（如 SnowLuma 侧的挂载路径）时直接拼 URI；
+        否则先按当前进程工作目录补成绝对路径，再由 ``features.wsl_mode``
+        决定是否转换为 ``/mnt/<盘符>/...`` 挂载路径。
+
+        Args:
+            value: 本地文件路径（可为相对路径）。
+
+        Returns:
+            str: ``file://`` URI。
+        """
+        if value.startswith("/"):
+            return f"file://{value}"
+        path = Path(value)
+        if not path.is_absolute():
+            path = path.resolve()
+        if self._is_wsl_path_mode():
+            return f"file://{self._to_local_mount_path(str(path))}"
+        return path.as_uri()
+
+    def _to_snowluma_video_source(self, value: str) -> str:
+        """将框架视频数据归一化为 SnowLuma video 段可加载的媒体源。
+
+        框架内部以 ``base64|`` 前缀下发 base64 数据（见 ``normalize_base64``），
+        SnowLuma 要求 ``base64://``；``data:`` / ``http(s)://`` / ``file://``
+        直接透传；本地文件路径交给 ``_to_snowluma_local_uri`` 转换。
+
+        Args:
+            value: 视频数据（base64 / 直链 / 本地路径）。
+
+        Returns:
+            str: 归一化后的媒体源。
+        """
+        if value.startswith("base64|"):
+            payload = value[len("base64|"):]
+            if self._looks_like_base64(payload):
+                return f"base64://{payload}"
+            # 调用方可能直接传本地路径（如 doubao_send_video 把文件路径
+            # 交给契约是 base64/URL 的 send_video），框架 normalize_base64
+            # 会无条件套上 base64| 前缀。内容不是 base64 时按文件路径处理，
+            # 否则 SnowLuma 会把它当 base64 解码成一堆无效字节。
+            return self._to_snowluma_local_uri(payload)
+        if value.startswith(("base64://", "data:", "http://", "https://", "file://")):
+            return value
+        return self._to_snowluma_local_uri(value)
 
     def handle_image_message(self, encoded_image: str) -> dict:
         """处理图片消息。
@@ -514,6 +624,24 @@ class SendHandler:
             "data": {"file": voice_url},
         }
 
+    def handle_video_message(self, video_data: str) -> dict:
+        """处理视频消息段。
+
+        SnowLuma 的 video 段只接受一个由它自行加载的媒体源（本地路径 /
+        ``file://`` / ``http(s)://`` 直链 / ``base64://`` 内联数据），
+        且要求 video 是消息中唯一的段。
+
+        Args:
+            video_data: 视频数据（base64 / 直链 / 本地路径）。
+
+        Returns:
+            dict: OneBot video 段。
+        """
+        return {
+            "type": "video",
+            "data": {"file": self._to_snowluma_video_source(video_data)},
+        }
+
     def handle_music_message(self, song_id: str) -> dict:
         """处理音乐消息"""
         return {
@@ -529,10 +657,14 @@ class SendHandler:
         }
 
     def handle_file_message(self, file_path: str) -> dict:
-        """处理文件消息"""
+        """处理文件消息。
+
+        本地路径经 ``_to_snowluma_local_uri`` 转换后拼 ``file://`` URI，
+        保证 SnowLuma 在容器/宿主分离部署时也能读到文件。
+        """
         return {
             "type": "file",
-            "data": {"file": f"file://{file_path}"},
+            "data": {"file": self._to_snowluma_local_uri(file_path)},
         }
 
     def delete_msg_command(self, args: dict[str, Any]) -> tuple[str, dict[str, Any]]:

@@ -231,6 +231,18 @@ class SnowLumaAdapterConfig(BaseConfig):
             depends_on="enable_video_processing",
             depends_value=True
         )
+        wsl_mode: bool = Field(
+            default=False,
+            description=(
+                "是否把本地媒体文件（视频/文件）的路径转为 WSL/Docker 挂载路径。"
+                "SnowLuma 跑在 Docker 或 WSL 中时，宿主机的 Windows 盘符路径"
+                "在它那一侧不存在（如 E:\\dir\\a.mp4 → /mnt/e/dir/a.mp4）；"
+                "与本 Bot 同环境运行时保持关闭即可"
+            ),
+            label="WSL/容器路径",
+            tag="file",
+            hint="开启后 E:\\dir\\a.mp4 会转为 /mnt/e/dir/a.mp4（需宿主目录已按盘符挂载到 /mnt）"
+        )
         forward_image_threshold: int = Field(
             default=5,
             description=(
