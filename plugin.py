@@ -277,8 +277,8 @@ class SnowLumaAdapter(BaseAdapter):
                 prev_connected = current_connected
             except asyncio.CancelledError:
                 break
-            except Exception:
-                pass
+            except Exception as error:
+                logger.error(f"SnowLuma 连接监控失败: {type(error).__name__}")
 
     async def health_check(self) -> bool:
         """健康检查。

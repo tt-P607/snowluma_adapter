@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import re
-import time
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -60,7 +60,14 @@ class MessageHandler:
 
         message_type = raw.get("message_type")
         message_id = str(raw.get("message_id", ""))
-        message_time = time.time()
+        message_time = raw.get("time")
+        if (
+            isinstance(message_time, bool)
+            or not isinstance(message_time, (int, float))
+            or not math.isfinite(message_time)
+            or message_time <= 0
+        ):
+            raise ValueError("SnowLuma 消息缺少有效的原始时间")
 
         msg_builder = MessageBuilder()
 
@@ -155,7 +162,9 @@ class MessageHandler:
                 reply_meta["reply_target_sender_id"] = reply_target_sender_id
             msg_builder.metadata(reply_meta)
 
-        return msg_builder.build()
+        envelope = msg_builder.build()
+        envelope["message_info"]["time"] = message_time
+        return envelope
 
     async def handle_single_segment(
         self, segment: dict, raw_message: dict, in_reply: bool = False
