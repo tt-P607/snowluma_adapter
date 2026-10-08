@@ -13,11 +13,13 @@ import httpx
 import orjson
 from mofox_wire import MessageBuilder, MessageEnvelope, SegPayload
 from mofox_wire.types import UserRole
+from websockets.exceptions import ConnectionClosed
 
 from src.app.plugin_system.api.log_api import get_logger
 from src.core.utils.base64_helper import base64_encode_bytes
 
 from ....config import SnowLumaAdapterConfig
+from ...api_constants import SnowLumaAction
 from ...event_models import ACCEPT_FORMAT, QQ_FACE, RealMessageType
 from ..utils import (
     fetch_ptt_text,
@@ -35,6 +37,10 @@ if TYPE_CHECKING:
     from ....plugin import SnowLumaAdapter
 
 logger = get_logger("snowluma_adapter")
+
+_FLASH_SHARE_PATTERN = re.compile(
+    r"(?P<url>https://qfile\.qq\.com/q/[A-Za-z0-9]+)"
+)
 
 
 class MessageHandler:
@@ -218,6 +224,12 @@ class MessageHandler:
                 return await self._handle_contact_message(segment)
             case RealMessageType.file:
                 return await self._handle_file_message(segment)
+            case RealMessageType.flash_file:
+                flash_data = segment.get("data", {})
+                return await self._handle_flash_message(
+                    fileset_id=flash_data.get("file_set_id"),
+                    title=flash_data.get("title"),
+                )
 
             case _:
                 logger.warning(f"Unsupported segment type: {seg_type}")
@@ -226,10 +238,91 @@ class MessageHandler:
     # Utility methods for handling different message types
 
     async def _handle_text_message(self, segment: dict) -> SegPayload:
-        """处理纯文本消息"""
+        """保留纯文本，并将官方闪传分享链接展开为文件信息。"""
         message_data = segment.get("data", {})
         plain_text = message_data.get("text", "")
-        return {"type": "text", "data": plain_text}
+        content_parts: list[str] = []
+        last_end = 0
+        for match in _FLASH_SHARE_PATTERN.finditer(plain_text):
+            content_parts.append(plain_text[last_end:match.start()])
+            flash_message = await self._handle_flash_message(share_url=match["url"])
+            content_parts.append(cast(str, flash_message["data"]))
+            last_end = match.end()
+        content_parts.append(plain_text[last_end:])
+        return {"type": "text", "data": "".join(content_parts)}
+
+    async def _query_flash_metadata(
+        self, action: SnowLumaAction, params: dict[str, str]
+    ) -> Any:
+        """查询闪传元数据并校验 OneBot 响应，不访问文件下载链接。"""
+        response = await self.adapter.send_snowluma_api(action.value, params)
+        if response.get("status") != "ok" or response.get("retcode") != 0:
+            raise ValueError("闪传元数据 API 返回失败")
+        return response.get("data")
+
+    async def _handle_flash_message(
+        self,
+        *,
+        fileset_id: str | None = None,
+        share_url: str | None = None,
+        title: str | None = None,
+    ) -> SegPayload:
+        """将闪传文件集转换为文件清单文本，只查询元数据，不下载文件。"""
+        try:
+            if share_url:
+                fileset_data = await self._query_flash_metadata(
+                    SnowLumaAction.GET_FILESET_ID, {"share_code": share_url}
+                )
+                if not isinstance(fileset_data, dict):
+                    raise ValueError("闪传文件集 ID 响应格式无效")
+                fileset_id = fileset_data.get("fileset_id")
+            if not isinstance(fileset_id, str) or not fileset_id.strip():
+                raise ValueError("闪传消息缺少文件集 ID")
+
+            files = await self._query_flash_metadata(
+                SnowLumaAction.GET_FLASH_FILE_LIST, {"fileset_id": fileset_id}
+            )
+            if not isinstance(files, list):
+                raise TypeError("闪传文件列表响应格式无效")
+
+            content_parts = [f"[QQ闪传：{len(files)}个文件]"]
+            if title:
+                content_parts.append(f"标题：{title}")
+            for file_info in files:
+                if not isinstance(file_info, dict):
+                    raise TypeError("闪传文件信息格式无效")
+                file_name = file_info.get("file_name") or file_info.get("orig_name")
+                if not isinstance(file_name, str) or not file_name:
+                    raise ValueError("闪传文件信息缺少文件名")
+                content_parts.append(f"文件：{file_name}")
+                file_size = file_info.get("size")
+                if isinstance(file_size, int) and not isinstance(file_size, bool) and file_size >= 0:
+                    size_value = float(file_size)
+                    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+                        if size_value < 1024 or unit == "TiB":
+                            break
+                        size_value /= 1024
+                    size_text = f"{file_size:,} 字节"
+                    if unit != "B":
+                        size_text = f"{size_value:.1f} {unit} ({size_text})"
+                    content_parts.append(f"大小：{size_text}")
+                else:
+                    content_parts.append("大小：未提供")
+                if not share_url and isinstance(file_info.get("share_url"), str):
+                    share_url = file_info["share_url"]
+            if share_url:
+                content_parts.append(f"分享链接：{share_url}")
+            return {"type": "text", "data": "\n".join(content_parts)}
+        except (ConnectionClosed, OSError, RuntimeError, TypeError, ValueError) as error:
+            logger.warning(f"闪传文件信息查询失败（{type(error).__name__}）")
+            content_parts = ["[QQ闪传：文件列表获取失败]"]
+            if title:
+                content_parts.append(f"标题：{title}")
+            if share_url:
+                content_parts.append(f"分享链接：{share_url}")
+            elif fileset_id:
+                content_parts.append(f"文件集 ID：{fileset_id}")
+            return {"type": "text", "data": "\n".join(content_parts)}
 
     async def _handle_face_message(self, segment: dict) -> SegPayload | None:
         """处理表情消息"""
@@ -868,8 +961,7 @@ class MessageHandler:
                     sub_seg_data = msg_seg.get("data")
                     if not sub_seg_data:
                         continue
-                    text_message = sub_seg_data.get("text")
-                    sub_segs.append({"type": "text", "data": text_message})
+                    sub_segs.append(await self._handle_text_message(msg_seg))
                 elif msg_type == RealMessageType.image:
                     image_count += 1
                     image_data = msg_seg.get("data", {})
@@ -886,6 +978,10 @@ class MessageHandler:
                     file_seg = await self._handle_file_message(msg_seg)
                     if file_seg is not None:
                         sub_segs.append(file_seg)
+                elif msg_type == RealMessageType.flash_file:
+                    flash_seg = await self.handle_single_segment(msg_seg, raw_message or {})
+                    if flash_seg is not None:
+                        sub_segs.append(flash_seg)
                 elif msg_type == RealMessageType.record:
                     record_seg = await self._handle_record_message(msg_seg, raw_message or {})
                     if record_seg is not None:
