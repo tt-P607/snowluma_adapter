@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 from mofox_wire import GroupInfoPayload, MessageEnvelope, MessageInfoPayload, SegPayload, UserInfoPayload
 
 from src.app.plugin_system.api.log_api import get_logger
+from src.app.plugin_system.base import PlatformSendResult, PlatformSendStatus
 
 from ...event_models import CommandType
 from ..utils import convert_image_to_gif, get_image_format
@@ -26,22 +27,18 @@ class SendHandler:
     def __init__(self, adapter: "SnowLumaAdapter"):
         self.adapter = adapter
 
-    async def handle_message(self, envelope: MessageEnvelope) -> str | None:
+    async def handle_message(self, envelope: MessageEnvelope) -> PlatformSendResult:
         """
         处理来自核心的消息，将其转换为 SnowLuma 可接受的格式并发送
 
         Returns:
-            str | None: 发送成功且平台返回了消息 ID 时返回该 ID，否则返回 None
-
-        Raises:
-            ValueError: 消息段无法解析或缺少可识别的发送目标
-            RuntimeError: SnowLuma 返回失败响应
+            PlatformSendResult: 平台发送或命令执行的确认结果
         """
         logger.debug("接收到来自MoFox-Bot的消息，处理中")
 
         if not envelope:
             logger.warning("空的消息，跳过处理")
-            return None
+            return PlatformSendResult(success=False, error="消息为空")
 
         message_segment = envelope.get("message_segment")
         if isinstance(message_segment, list):
@@ -54,28 +51,25 @@ class SendHandler:
 
             if seg_type == "command":
                 logger.debug("处理命令")
-                await self.send_command(envelope)
-                return None
+                return await self.send_command(envelope)
             if seg_type == "adapter_command":
                 logger.debug("处理适配器命令")
-                await self.handle_adapter_command(envelope)
-                return None
+                return await self.handle_adapter_command(envelope)
             if seg_type == "adapter_response":
                 logger.debug("收到adapter_response消息，此消息应该由Bot端处理，跳过")
-                return None
+                return PlatformSendResult(
+                    success=True, status=PlatformSendStatus.UNKNOWN,
+                    error="响应信封未下发平台",
+                )
 
         return await self.send_normal_message(envelope)
 
-    async def send_normal_message(self, envelope: MessageEnvelope) -> str | None:
+    async def send_normal_message(self, envelope: MessageEnvelope) -> PlatformSendResult:
         """
         处理普通消息发送
 
         Returns:
-            str | None: 发送成功且平台返回了消息 ID 时返回该 ID，否则返回 None
-
-        Raises:
-            ValueError: 消息段无法解析或缺少可识别的发送目标
-            RuntimeError: SnowLuma 返回失败响应
+            PlatformSendResult: 仅同步成功且含平台消息 ID 时返回成功
         """
         message_info: MessageInfoPayload = envelope.get("message_info", {})
         message_segment: SegPayload = envelope.get("message_segment", {})  # type: ignore[assignment]
@@ -95,10 +89,12 @@ class SendHandler:
             processed_message = await self.handle_seg_recursive(seg_data, user_info or {}, group_info)  # type: ignore[arg-type]
         except Exception as e:
             logger.error(f"处理消息段时发生错误: {e}")
-            raise
+            return PlatformSendResult(success=False, error=str(e))
 
         if not processed_message:
-            raise ValueError("消息未解析出任何可发送内容，可能是消息段类型不受支持")
+            return PlatformSendResult(
+                success=False, error="消息未解析出任何可发送内容，可能是消息段类型不受支持",
+            )
 
         # 🔧 确保 reply 消息段始终在列表最前面
         # 排序原则：reply 类型优先级最高（排序值为 0），其他类型保持原有顺序（排序值为 1）
@@ -116,7 +112,9 @@ class SendHandler:
             action = "send_private_msg"
             id_name = "user_id"
         else:
-            raise ValueError("无法识别的发送目标：群聊缺少 group_info，私聊缺少 user_info")
+            return PlatformSendResult(
+                success=False, error="无法识别的发送目标：群聊缺少 group_info，私聊缺少 user_info",
+            )
         logger.debug(
             f"准备发送 SnowLuma 消息: action={action}, 消息段数量={len(processed_message)}"
         )
@@ -127,22 +125,56 @@ class SendHandler:
                 "message": processed_message,
             },
         )
-        if response.get("status") != "ok":
-            raise RuntimeError(
-                f"SnowLuma 消息发送失败: retcode={str(response.get('retcode'))[:32]}"
+        return self._result_from_response(response, action)
+
+    @staticmethod
+    def _result_from_response(response: dict[str, Any], action: str) -> PlatformSendResult:
+        """区分平台确认、明确失败和未知结果，仅提取协议错误字段。"""
+        status = response.get("status")
+        retcode = response.get("retcode")
+        if status == "ok" and type(retcode) is int and retcode == 0:
+            data = response.get("data")
+            message_id = data.get("message_id") if isinstance(data, dict) else None
+            if action in (
+                "send_msg", "send_group_msg", "send_private_msg", CommandType.AI_VOICE_SEND.value,
+                CommandType.SEND_GROUP_FORWARD_MSG.value, "send_private_forward_msg",
+            ) and type(message_id) is not int:
+                return PlatformSendResult(
+                    success=False, status=PlatformSendStatus.UNKNOWN,
+                    error="SnowLuma 响应缺少有效消息 ID，发送结果未确认", response=response,
+                )
+            return PlatformSendResult(
+                success=True, message_id=str(message_id) if type(message_id) is int else None,
+                response=response,
             )
 
-        logger.info("消息发送成功")
+        if status == "timeout":
+            outcome = PlatformSendStatus.UNKNOWN
+            reason = "SnowLuma 请求超时，发送结果未知"
+        elif status == "async":
+            outcome = PlatformSendStatus.UNKNOWN
+            reason = "SnowLuma 已异步受理，执行结果未确认"
+        elif status == "failed" or (status == "ok" and type(retcode) is int and retcode != 0):
+            outcome = PlatformSendStatus.FAILED
+            reason = "SnowLuma 执行失败"
+        else:
+            outcome = PlatformSendStatus.UNKNOWN
+            reason = "SnowLuma 未返回有效成功回执，执行结果未确认"
 
-        # 提取平台返回的消息 ID，没有则返回 None
-        data = response.get("data")
-        if isinstance(data, dict):
-            message_id = data.get("message_id")
-            if message_id is not None:
-                return str(message_id)
-        return None
+        fields = []
+        if isinstance(status, str):
+            fields.append(f"status={status}")
+        if type(retcode) is int:
+            fields.append(f"retcode={retcode}")
+        for key in ("message", "wording"):
+            value = response.get(key)
+            if isinstance(value, str) and value.strip():
+                fields.append(f"{key}={value.strip()}")
+        if fields:
+            reason += f"（{', '.join(fields)}）"
+        return PlatformSendResult(success=False, status=outcome, error=reason, response=response)
 
-    async def send_command(self, envelope: MessageEnvelope) -> None:
+    async def send_command(self, envelope: MessageEnvelope) -> PlatformSendResult:
         """
         处理命令类
         """
@@ -197,32 +229,27 @@ class SendHandler:
                 command, args_dict = self.handle_send_group_forward_msg_command(args, group_info)
             else:
                 logger.error(f"未知命令: {command_name}")
-                return
+                return PlatformSendResult(success=False, error=f"未知 SnowLuma 命令: {command_name}")
         except Exception as e:
             logger.error(f"处理命令时发生错误: {e}")
-            return None
+            return PlatformSendResult(success=False, error=f"SnowLuma 命令参数无效: {e}")
 
         if not command or not args_dict:
             logger.error("命令或参数缺失")
-            return None
+            return PlatformSendResult(success=False, error="SnowLuma 命令或参数缺失")
 
         logger.debug(f"准备向 SnowLuma 发送命令: command={command}")
         response = await self.send_message_to_snowluma(command, args_dict)
+        return self._result_from_response(response, command)
 
-        if response.get("status") == "ok":
-            logger.info(f"命令 {command_name} 执行成功")
-        else:
-            logger.warning(
-                f"命令 {command_name} 执行失败: retcode={str(response.get('retcode'))[:32]}"
-            )
-
-    async def handle_adapter_command(self, envelope: MessageEnvelope) -> None:
+    async def handle_adapter_command(self, envelope: MessageEnvelope) -> PlatformSendResult:
         """
         处理适配器命令类 - 用于直接向 SnowLuma 发送命令并返回结果
         """
         logger.info("处理适配器命令中")
         segment: SegPayload = envelope.get("message_segment", {})  # type: ignore[assignment]
         seg_data: dict[str, Any] = segment.get("data", {}) if isinstance(segment, dict) else {}  # type: ignore[assignment]
+        result: PlatformSendResult | None = None
 
         try:
             action = seg_data.get("action")
@@ -232,7 +259,7 @@ class SendHandler:
 
             if not action:
                 logger.error("适配器命令缺少action参数")
-                return
+                return PlatformSendResult(success=False, error="SnowLuma 适配器命令缺少 action")
 
             logger.debug(f"执行适配器命令: {action}")
 
@@ -241,6 +268,7 @@ class SendHandler:
                 response = await self.send_message_to_snowluma(action, params, timeout=40.0)
             else:
                 response = await self.send_message_to_snowluma(action, params, timeout=timeout)
+            result = self._result_from_response(response, action)
 
             # 构建adapter_response消息信封发回核心
             if request_id and self.adapter.core_sink:
@@ -264,15 +292,16 @@ class SendHandler:
                 await self.adapter.core_sink.send(response_envelope)
                 logger.debug(f"已发送响应信封到核心: request_id={request_id}")
 
-            if response.get("status") == "ok":
-                logger.info(f"适配器命令 {action} 执行成功")
-            else:
-                logger.warning(
-                    f"适配器命令 {action} 执行失败: retcode={str(response.get('retcode'))[:32]}"
-                )
+            return result
 
         except Exception as e:
             logger.error(f"处理适配器命令时发生错误: {e}")
+            return PlatformSendResult(
+                success=False, status=result.status if result else PlatformSendStatus.FAILED,
+                message_id=result.message_id if result else None,
+                error=f"SnowLuma 适配器命令处理失败: {e}",
+                response=result.response if result else None,
+            )
 
     def get_level(self, seg_data: SegPayload) -> int:
         if seg_data.get("type") == "seglist":
@@ -824,8 +853,11 @@ class SendHandler:
         try:
             response = await self.adapter.send_snowluma_api(action, params, timeout=timeout)
             return response or {"status": "error", "message": "no response"}
+        except TimeoutError:
+            logger.warning("SnowLuma 请求等待响应超时，发送结果未知")
+            return {"status": "timeout"}
         except Exception as e:
-            logger.error(f"发送消息失败: {e}")
+            logger.warning(f"SnowLuma 请求异常，发送结果未知: {e}", exc_info=True)
             return {"status": "error", "message": str(e)}
 
     def handle_set_group_name_command(self, args: dict[str, Any], group_info: dict[str, Any] | None) -> tuple[str, dict[str, Any]]:

@@ -391,13 +391,10 @@ class SnowLumaAdapter(BaseAdapter):
         而是调用 SnowLuma API（send_group_msg, send_private_msg 等）
 
         Returns:
-            PlatformSendResult: 发送结果，包含成功/失败状态与平台消息 ID
+            PlatformSendResult: 平台确认状态、消息 ID 与错误详情
         """
         try:
-            message_id = await self.send_handler.handle_message(envelope)
-            if message_id:
-                return PlatformSendResult(success=True, message_id=message_id)
-            return PlatformSendResult(success=True)
+            return await self.send_handler.handle_message(envelope)
         except Exception as e:
             logger.error(f"发送 SnowLuma 消息失败: {e}")
             return PlatformSendResult(success=False, error=str(e))

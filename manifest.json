@@ -5,7 +5,8 @@
     "log_api": "1.0.0",
     "prompt_api": "1.0.0",
     "stream_api": "2.0.0",
-    "media_api": "1.2.0"
+    "media_api": "1.2.0",
+    "send_api": "1.2.0"
   },
   "display_name": "SnowLuma 适配器",
   "version": "2.2.12",
