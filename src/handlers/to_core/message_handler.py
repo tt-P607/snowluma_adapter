@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import math
 import re
 from datetime import datetime
@@ -567,42 +568,34 @@ class MessageHandler:
     ) -> SegPayload | None:
         """处理语音消息。
 
-        优先使用 SnowLuma 原生 ``fetch_ptt_text`` 进行语音转文字；
-        失败时通过 ``get_record`` 下载 WAV 并返回 voice 段，交由框架 ASR 识别；
-        均失败则返回 ``[语音(识别失败)]`` 占位符。
-
-        在语音消息识别成功后，会向当前聊天流注入一条提示词，
-        提醒 LLM 注意语音识别结果可能存在同音/近形字错误。
+        下载 WAV 原音；ASR 转写结果存在时仍保留音频数据。
+        时长从实际文件读取；文件处理失败时明确返回错误。
         """
         message_id = str(raw_message.get("message_id", ""))
         segment_data = segment.get("data", {})
         file = segment_data.get("file", "")
         file_id = segment_data.get("file_id", "")
+        from src.app.plugin_system.types import ChatStream
+
+        message_type = raw_message.get("message_type")
+        group_id = raw_message.get("group_id")
+        sender_info = raw_message.get("sender", {})
+        user_id = sender_info.get("user_id", "")
+        is_group = message_type == "group" and bool(group_id)
+        stream_id = ChatStream.generate_stream_id(
+            platform="qq",
+            group_id=str(group_id) if is_group else "",
+            user_id="" if is_group else str(user_id or "no_id"),
+        )
 
         def _inject_voice_hint() -> None:
             """向当前流注入一条 once 语音提示词，框架消费后自动从 store 删除。"""
             try:
                 from src.app.plugin_system.api.prompt_api import add_stream_reminder
                 from src.core.prompt import (
-                    SystemReminderInsertType,
                     SystemReminderConsumeType,
+                    SystemReminderInsertType,
                 )
-                from src.core.models.stream import ChatStream
-
-                msg_type = raw_message.get("message_type")
-                group_id = raw_message.get("group_id")
-                sender_info = raw_message.get("sender", {})
-                user_id = sender_info.get("user_id", "")
-
-                if msg_type == "group" and group_id:
-                    stream_id = ChatStream.generate_stream_id(
-                        platform="qq", group_id=str(group_id)
-                    )
-                else:
-                    stream_id = ChatStream.generate_stream_id(
-                        platform="qq", user_id=str(user_id)
-                    )
-
                 add_stream_reminder(
                     stream_id=stream_id,
                     bucket="actor",
@@ -641,18 +634,30 @@ class MessageHandler:
         # 获取语音 base64 数据，返回 voice 段让框架注入 media_id
         if file or file_id:
             try:
-                record_data = await get_record_detail(file, file_id, adapter=self.adapter)
+                record_data = await get_record_detail(
+                    file,
+                    file_id,
+                    adapter=self.adapter,
+                )
                 if record_data:
                     base64_data = record_data.get("base64") or record_data.get("data") or ""
                     if base64_data:
-                        # SL 转文字成功时，预先把识别结果写入 Voices 表和缓存表，避免框架重复 ASR
+                        audio_data = base64.b64decode(base64_data, validate=True)
+                        from src.app.plugin_system.api.media_api import (
+                            get_media_duration,
+                        )
+
+                        duration_seconds = await get_media_duration(audio_data)
+                        # ASR 转写成功时，将识别结果写入 Voices 表和缓存表，避免框架重复转写。
                         if sl_voice_text:
                             try:
                                 from src.app.plugin_system.api.media_api import (
                                     save_description_cache,
                                     save_media_info,
                                 )
-                                from src.core.managers.media_manager import get_media_manager
+                                from src.core.managers.media_manager import (
+                                    get_media_manager,
+                                )
 
                                 manager = get_media_manager()
                                 voice_hash = manager.compute_media_hash(base64_data)
@@ -675,10 +680,18 @@ class MessageHandler:
 
                         logger.debug("通过 get_record 获取到语音 base64 数据，返回 voice 段")
                         _inject_voice_hint()
-                        return {"type": "voice", "data": base64_data}
+                        return {
+                            "type": "voice",
+                            "data": {
+                                "base64": base64_data,
+                                "format": "wav",
+                                "duration_seconds": duration_seconds,
+                            },
+                        }
                     logger.debug("get_record 返回数据中未找到 base64 字段")
             except Exception as e:
-                logger.warning(f"get_record 获取语音失败: {e!s}")
+                logger.warning(f"语音文件处理失败: {e!s}")
+                return {"type": "text", "data": "[语音文件处理失败]"}
 
         # 无法获取 base64 数据时，用 SL 转文字结果作为 text 段兜底
         if sl_voice_text:
@@ -715,6 +728,9 @@ class MessageHandler:
                 # 本地文件处理
                 async with asyncio.timeout(io_timeout):
                     video_data = await asyncio.to_thread(Path(file_path).read_bytes)
+                from src.app.plugin_system.api.media_api import get_media_duration
+
+                duration_seconds = await get_media_duration(video_data)
                 video_base64 = await asyncio.to_thread(
                     base64_encode_bytes,
                     video_data,
@@ -727,6 +743,7 @@ class MessageHandler:
                         "base64": video_base64,
                         "filename": Path(file_path).name,
                         "size_mb": len(video_data) / (1024 * 1024),
+                        "duration_seconds": duration_seconds,
                     },
                 }
             elif video_url:
@@ -743,19 +760,24 @@ class MessageHandler:
                     logger.warning(f"视频下载失败: {download_result.get('error', '未知错误')}")
                     return {"type": "text", "data": f"[视频消息] ({download_result.get('error', '下载失败')})"}
 
+                video_data = download_result["data"]
+                from src.app.plugin_system.api.media_api import get_media_duration
+
+                duration_seconds = await get_media_duration(video_data)
                 video_base64 = await asyncio.to_thread(
                     base64_encode_bytes,
-                    download_result["data"],
+                    video_data,
                 )
-                logger.debug(f"视频下载成功，大小: {len(download_result['data']) / (1024 * 1024):.2f} MB")
+                logger.debug(f"视频下载成功，大小: {len(video_data) / (1024 * 1024):.2f} MB")
 
                 return {  # type: ignore[return-value]
                     "type": "video",
                     "data": {
                         "base64": video_base64,
                         "filename": download_result.get("filename", "video.mp4"),
-                        "size_mb": len(download_result["data"]) / (1024 * 1024),
+                        "size_mb": len(video_data) / (1024 * 1024),
                         "url": video_url,
+                        "duration_seconds": duration_seconds,
                     },
                 }
             else:
