@@ -1,5 +1,13 @@
 # SnowLuma API 参考手册
 
+## 语音通话 Service
+
+适配器注册公开 Service `snowluma_adapter:service:voice_call`，提供状态查询、显式拨号、来电控制、实时采音和播放。通话音频操作要求传入当前 `callId` 与 `generation`，并在 `phase` 为 `connected` 时执行。采音通过 adapter 现有 OneBot WebSocket 多帧分发；取消本地迭代器只停止向调用方交付，不会关闭主连接或挂断通话。上游没有 unsubscribe action，因此远端采音订阅会持续到该流终结或主连接断开。`get_peer(adapter_signature, user_id)` 通过只读 `get_stranger_info` 按 QQ 号读取 `uid`、`user_id` 和 `nickname`，不会将 UID 猜作 QQ 号。
+
+`play_audio` 保留上游 PCM 读取粒度，跨块聚合至最多 32 KiB 后串行提交；48 kHz 单声道 S16LE 的 32 KiB 约为 341 ms 音频。发送块不超过上游声明的限制，正常输入结束时立即发送不足一块的尾部，不缓存整段 TTS。开流和结束时查询当前通话；每次 append 由上游播放流校验通话代次，并核对连续序号及本块接收字节数。块不自动重试，失败或取消仍请求取消播放，成功以完整字节数和 drained 确认为准。
+
+播放统计区分 `upstream_wait`（等待下一块 PCM）、`append_ack_wait`（上传回执，包含网络和上游背压）、`control_wait` 和 `drain_wait`。这些是调用边界耗时，不是纯模型生成时长；TTS 流总耗时也可能包含下游等待。
+
 本文档列出了 SnowLuma 提供的所有 171 个 API 及其说明。这些 API 已被定义在 `src.api_constants.SnowLumaAction` 枚举中。
 
 ## 开发者调用方式

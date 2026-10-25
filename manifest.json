@@ -31,6 +31,11 @@
       "component_type": "adapter",
       "component_name": "snowluma_adapter",
       "dependencies": []
+    },
+    {
+      "component_type": "service",
+      "component_name": "voice_call",
+      "dependencies": []
     }
   ],
   "entry_point": "plugin.py",

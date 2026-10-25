@@ -12,16 +12,18 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 import orjson
 from mofox_wire import CoreSink, MessageEnvelope, WebSocketAdapterOptions
 
-
+from src.app.plugin_system.api import event_api
 from src.app.plugin_system.api.log_api import get_logger
 from src.core.components.base import BaseAdapter, BasePlugin
-from src.core.components.types import PlatformSendResult
 from src.core.components.loader import register_plugin
+from src.core.components.types import PlatformSendResult
 
 from .config import SnowLumaAdapterConfig
 from .src.handlers import utils as handler_utils
@@ -30,7 +32,22 @@ from .src.handlers.to_core.meta_event_handler import MetaEventHandler
 from .src.handlers.to_core.notice_handler import NoticeHandler
 from .src.handlers.to_core.request_handler import RequestHandler
 from .src.handlers.to_snowluma.send_handler import SendHandler
+from .src.voice_service import SnowLumaVoiceService
+
 logger = get_logger("snowluma_adapter")
+MAX_STREAM_RESPONSES = 16
+
+
+@dataclass
+class _StreamResponse:
+    """保存一个 OneBot 多帧响应的本地订阅状态。"""
+
+    connection: Any
+    queue: asyncio.Queue[dict[str, Any] | BaseException] = field(
+        default_factory=lambda: asyncio.Queue(maxsize=32)
+    )
+    active: bool = True
+    capture_key: tuple[str, int] | None = None
 
 
 def _validate_bot_identity(config: SnowLumaAdapterConfig) -> None:
@@ -102,6 +119,8 @@ class SnowLumaAdapter(BaseAdapter):
 
         # 响应池：用于存储等待的 API 响应
         self._response_pool: dict[str, asyncio.Future] = {}
+        self._stream_response_pool: dict[str, _StreamResponse] = {}
+        self._voice_capture_subscriptions: set[tuple[str, int]] = set()
         self._response_timeout = 30.0
 
         # WebSocket 连接（用于发送 API 请求）
@@ -131,6 +150,12 @@ class SnowLumaAdapter(BaseAdapter):
 
         config = cast(SnowLumaAdapterConfig, self.plugin.config)
         features_config = config.features
+        if any(
+            subscription.connection is not self._ws
+            for subscription in self._stream_response_pool.values()
+        ):
+            self._invalidate_stream_responses(RuntimeError("SnowLuma connection replaced"))
+
         post_type = raw.get("post_type")
 
         # 获取用户信息（根据事件类型从不同字段获取）
@@ -236,6 +261,7 @@ class SnowLumaAdapter(BaseAdapter):
             if not future.done():
                 future.cancel()
         self._response_pool.clear()
+        self._invalidate_stream_responses(RuntimeError("SnowLuma adapter unloaded"))
 
         logger.info("SnowLuma 适配器已关闭")
 
@@ -301,6 +327,7 @@ class SnowLumaAdapter(BaseAdapter):
         client 模式下使用父类默认的 stop() → start() 逻辑。
         """
         if isinstance(self._transport_config, WebSocketAdapterOptions) and self._transport_config.mode == "server":
+            self._invalidate_stream_responses(RuntimeError("SnowLuma connection replaced"))
             # server 模式：只清理 _ws，不关闭服务器
             if self._ws and not self._ws.closed:
                 try:
@@ -319,6 +346,7 @@ class SnowLumaAdapter(BaseAdapter):
             return
 
         # client 模式：使用父类默认的 stop() → start() 逻辑
+        self._invalidate_stream_responses(RuntimeError("SnowLuma connection replaced"))
         await self.stop()
         if self.plugin and self.plugin.config:
             config = cast(SnowLumaAdapterConfig, self.plugin.config)
@@ -345,6 +373,28 @@ class SnowLumaAdapter(BaseAdapter):
         # API 响应（没有 post_type，有 echo）
         if post_type is None and "echo" in raw:
             echo = raw.get("echo")
+            if echo and echo in self._stream_response_pool:
+                subscription = self._stream_response_pool[echo]
+                if raw.get("stream") != "stream-action":
+                    return None
+                packet = raw.get("data")
+                terminal = isinstance(packet, dict) and packet.get("type") in {
+                    "response", "error", "reset",
+                }
+                if subscription.active:
+                    try:
+                        subscription.queue.put_nowait(raw)
+                        await asyncio.sleep(0)
+                    except asyncio.QueueFull:
+                        subscription.active = False
+                        while not subscription.queue.empty():
+                            subscription.queue.get_nowait()
+                        subscription.queue.put_nowait(RuntimeError("SnowLuma stream response queue overflow"))
+                if terminal:
+                    self._stream_response_pool.pop(echo, None)
+                    if subscription.capture_key is not None:
+                        self._voice_capture_subscriptions.discard(subscription.capture_key)
+                return None
             if echo and echo in self._response_pool:
                 future = self._response_pool[echo]
                 if not future.done():
@@ -362,6 +412,10 @@ class SnowLumaAdapter(BaseAdapter):
 
             # 通知事件
             elif post_type == "notice":
+                await event_api.publish_event(
+                    "snowluma_adapter:notice_received",
+                    {"adapter_signature": self._signature_, "notice": raw},
+                )
                 await self.notice_handler.handle_notice(raw)
                 return None
 
@@ -457,6 +511,80 @@ class SnowLumaAdapter(BaseAdapter):
             # 清理响应池
             self._response_pool.pop(echo, None)
 
+    def _invalidate_stream_responses(self, error: BaseException) -> None:
+        """使当前连接上的多帧响应迭代器失败并清理通话订阅记录。"""
+        subscriptions = tuple(self._stream_response_pool.values())
+        self._stream_response_pool.clear()
+        self._voice_capture_subscriptions.clear()
+        for subscription in subscriptions:
+            if not subscription.active:
+                continue
+            subscription.active = False
+            while not subscription.queue.empty():
+                subscription.queue.get_nowait()
+            subscription.queue.put_nowait(error)
+
+    async def stream_snowluma_api(
+        self,
+        action: str,
+        params: dict[str, Any],
+        timeout: float = 30.0,
+        *,
+        capture_key: tuple[str, int] | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """通过 adapter 主 WebSocket 逐帧接收 OneBot Stream Action 响应。"""
+        connection = self._ws
+        if connection is None or getattr(connection, "closed", False):
+            raise RuntimeError("WebSocket 连接未建立")
+        if capture_key is not None and capture_key in self._voice_capture_subscriptions:
+            raise RuntimeError("该通话代次已有采音订阅")
+        if len(self._stream_response_pool) >= MAX_STREAM_RESPONSES:
+            raise RuntimeError("SnowLuma stream response registry is full")
+
+        for echo, subscription in tuple(self._stream_response_pool.items()):
+            if subscription.connection is not connection:
+                self._invalidate_stream_responses(RuntimeError("SnowLuma connection replaced"))
+                break
+
+        echo = str(uuid.uuid4())
+        subscription = _StreamResponse(connection=connection, capture_key=capture_key)
+        self._stream_response_pool[echo] = subscription
+        if capture_key is not None:
+            self._voice_capture_subscriptions.add(capture_key)
+        request = orjson.dumps({"action": action, "params": params, "echo": echo}).decode()
+        last_frame = asyncio.get_running_loop().time()
+        try:
+            await asyncio.wait_for(connection.send(request), timeout=timeout)
+            while True:
+                if self._ws is not connection or getattr(connection, "closed", False):
+                    self._invalidate_stream_responses(RuntimeError("SnowLuma connection changed"))
+                    raise RuntimeError("SnowLuma stream connection changed")
+                try:
+                    async with asyncio.timeout(min(timeout, 0.1)):
+                        frame = await subscription.queue.get()
+                except TimeoutError:
+                    if asyncio.get_running_loop().time() - last_frame >= timeout:
+                        raise TimeoutError(f"SnowLuma stream action timed out: {action}")
+                    continue
+                if isinstance(frame, BaseException):
+                    raise frame
+                last_frame = asyncio.get_running_loop().time()
+                yield frame
+                packet = frame.get("data")
+                if isinstance(packet, dict) and packet.get("type") in {"response", "error", "reset"}:
+                    return
+        finally:
+            current = self._stream_response_pool.get(echo)
+            if current is subscription:
+                if capture_key is not None and not subscription.active:
+                    pass
+                elif capture_key is not None:
+                    subscription.active = False
+                    while not subscription.queue.empty():
+                        subscription.queue.get_nowait()
+                else:
+                    self._stream_response_pool.pop(echo, None)
+
     def get_ws_connection(self):
         """获取 WebSocket 连接（用于发送 API 请求）"""
         if not self._ws:
@@ -482,7 +610,6 @@ class SnowLumaAdapterPlugin(BasePlugin):
     plugin_name = "snowluma_adapter"
     configs: list[type] = [SnowLumaAdapterConfig]
 
-
     def get_components(self) -> list[type]:
         """获取插件内所有组件类
 
@@ -496,4 +623,4 @@ class SnowLumaAdapterPlugin(BasePlugin):
             if not config.plugin.enabled:
                 logger.info("SnowLuma 适配器已在配置中禁用，跳过加载")
                 return []
-        return [SnowLumaAdapter]
+        return [SnowLumaAdapter, SnowLumaVoiceService]
